@@ -17,6 +17,7 @@ import torchvision.transforms as transforms
 
 import clip
 from models import prompters
+from models.prompters import TokenPrompter
 from utils import accuracy, AverageMeter, ProgressMeter, save_checkpoint
 from utils import cosine_lr, convert_models_to_fp32, refine_classname
 
@@ -128,15 +129,16 @@ def main():
         cudnn.deterministic = True
 
     # create model
-    model, preprocess = clip.load('ViT-B/32', device, jit=False, prompt_len=0)
+    model, preprocess = clip.load('ViT-B/32', device, jit=False, prompt_len=10)
 
-    print(model.positional_embedding.size())
+    # print(model.positional_embedding.size())
     # exit()
 
     convert_models_to_fp32(model)
     model.eval()
 
     prompter = prompters.__dict__[args.method](args).to(device)
+    add_prompter = TokenPrompter(10).to(device)
 
     # optionally resume from a checkpoint
     if args.resume:
@@ -202,7 +204,7 @@ def main():
     texts = [template.format(label) for label in class_names]
 
     # define criterion and optimizer
-    optimizer = torch.optim.SGD(prompter.parameters(),
+    optimizer = torch.optim.SGD(list(prompter.parameters())+list(add_prompter.parameters()),
                                 lr=args.learning_rate,
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay)
@@ -238,10 +240,10 @@ def main():
     for epoch in range(args.epochs):
 
         # train for one epoch
-        train(train_loader, texts, model, prompter, optimizer, scheduler, criterion, scaler, epoch, args)
+        train(train_loader, texts, model, prompter, add_prompter, optimizer, scheduler, criterion, scaler, epoch, args)
 
         # evaluate on validation set
-        acc1 = validate(val_loader, texts, model, prompter, criterion, args)
+        acc1 = validate(val_loader, texts, model, prompter, add_prompter, criterion, args)
 
         # remember best acc@1 and save checkpoint
         is_best = acc1 > best_acc1
@@ -270,7 +272,7 @@ upper_limit, lower_limit = 1,0
 def clamp(X, lower_limit, upper_limit):
     return torch.max(torch.min(X, upper_limit), lower_limit)
 
-def attack_pgd(prompter, model, criterion, X, target, text_tokens, alpha, attack_iters, norm, restarts=1, early_stop=True):
+def attack_pgd(prompter, model, add_prompter, criterion, X, target, text_tokens, alpha, attack_iters, norm, restarts=1, early_stop=True):
 
     delta = torch.zeros_like(X).cuda()
     if norm == "l_inf":
@@ -289,7 +291,8 @@ def attack_pgd(prompter, model, criterion, X, target, text_tokens, alpha, attack
         # output = model(normalize(X ))
 
         prompted_images = prompter(clip_img_preprocessing(X + delta))
-        output, _ = model(prompted_images, text_tokens)
+        prompt_token = add_prompter()
+        output, _ = model(prompted_images, text_tokens, prompt_token)
         loss = criterion(output, target)
 
 
@@ -352,7 +355,7 @@ def attack_pgd_noprompt(prompter, model, criterion, X, target, text_tokens, alph
     return delta
 
 
-def train(train_loader, texts, model, prompter, optimizer, scheduler, criterion, scaler, epoch, args):
+def train(train_loader, texts, model, prompter, add_prompter, optimizer, scheduler, criterion, scaler, epoch, args):
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
@@ -393,14 +396,14 @@ def train(train_loader, texts, model, prompter, optimizer, scheduler, criterion,
         # with automatic mixed precision
         with autocast():
 
-            delta = attack_pgd(prompter, model, criterion, images, target, text_tokens, alpha, attack_iters, 'l_inf')
+            delta = attack_pgd(prompter, model, add_prompter, criterion, images, target, text_tokens, alpha, attack_iters, 'l_inf')
             # print('delta', delta.min(), delta.max())
 
             tmp = clip_img_preprocessing(images + delta)
             prompted_images = prompter(tmp)
             # print('prompt size', prompted_images.size(), tmp.size())
-
-            output, _ = model(prompted_images, text_tokens)
+            prompt_token = add_prompter()
+            output, _ = model(prompted_images, text_tokens, prompt_token)
             loss = criterion(output, target)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -439,7 +442,7 @@ def train(train_loader, texts, model, prompter, optimizer, scheduler, criterion,
     return losses.avg, top1.avg
 
 
-def validate(val_loader, texts, model, prompter, criterion, args):
+def validate(val_loader, texts, model, prompter, add_prompter, criterion, args):
     batch_time = AverageMeter('Time', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
     top1_org = AverageMeter('Original Acc@1', ':6.2f')
@@ -466,7 +469,8 @@ def validate(val_loader, texts, model, prompter, criterion, args):
         # clean images, with prompt and without prompt
         # compute output
         with torch.no_grad():
-            output_prompt, _ = model(prompter(clip_img_preprocessing(images)), text_tokens)
+            prompt_token = add_prompter()
+            output_prompt, _ = model(prompter(clip_img_preprocessing(images)), text_tokens, prompt_token)
             output_org, _ = model(clip_img_preprocessing(images), text_tokens)
             loss = criterion(output_prompt, target)
 
@@ -483,12 +487,13 @@ def validate(val_loader, texts, model, prompter, criterion, args):
         # generate adv example
         alpha = 1. / 255
         attack_iters = 5
-        delta_prompt = attack_pgd(prompter, model, criterion, images, target, text_tokens, alpha, attack_iters, 'l_inf')
+        delta_prompt = attack_pgd(prompter, model, add_prompter, criterion, images, target, text_tokens, alpha, attack_iters, 'l_inf')
 
         # compute output
         torch.cuda.empty_cache()
         with torch.no_grad():
-            output_prompt_adv, _ = model(prompter(clip_img_preprocessing(images + delta_prompt)), text_tokens)
+            prompt_token = add_prompter()
+            output_prompt_adv, _ = model(prompter(clip_img_preprocessing(images + delta_prompt)), text_tokens, prompt_token)
             loss = criterion(output_prompt_adv, target)
 
         # bl attack
