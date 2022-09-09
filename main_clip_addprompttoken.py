@@ -11,7 +11,7 @@ import torch
 import torch.backends.cudnn as cudnn
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
-from torchvision.datasets import CIFAR100, CIFAR10, Caltech101, STL10
+from torchvision.datasets import CIFAR100, CIFAR10, Caltech101, STL10,  StanfordCars, Food101, SUN397
 
 import torchvision.transforms as transforms
 
@@ -23,7 +23,7 @@ from utils import cosine_lr, convert_models_to_fp32, refine_classname
 
 import torch.nn.functional as F
 import numpy as np
-
+import torch.nn as nn
 
 def parse_option():
     parser = argparse.ArgumentParser('Visual Prompting for CLIP')
@@ -32,7 +32,7 @@ def parse_option():
                         help='print frequency')
     parser.add_argument('--save_freq', type=int, default=50,
                         help='save frequency')
-    parser.add_argument('--batch_size', type=int, default=4,
+    parser.add_argument('--batch_size', type=int, default=16,
                         help='batch_size')
     parser.add_argument('--num_workers', type=int, default=16,
                         help='num of workers to use')
@@ -119,6 +119,40 @@ def clip_img_preprocessing(X):
 
     return X
 
+# for multiGPU clip
+def create_logits(x1, x2, logit_scale):
+    x1 = x1 / x1.norm(dim=-1, keepdim=True)
+    x2 = x2 / x2.norm(dim=-1, keepdim=True)
+
+    # cosine similarity as logits
+    logits_per_x1 = logit_scale * x1 @ x2.t()
+    logits_per_x2 = logit_scale * x2 @ x1.t()
+
+    # shape = [global_batch_size, global_batch_size]
+    return logits_per_x1, logits_per_x2
+
+class TextCLIP(nn.Module):
+    def __init__(self, model):
+        super(TextCLIP, self).__init__()
+        self.model = model
+
+    def forward(self, text):
+        return self.model.encode_text(text)
+
+class ImageCLIP(nn.Module):
+    def __init__(self, model):
+        super(ImageCLIP, self).__init__()
+        self.model = model
+
+    def forward(self, image, prompt_token=None):
+        return self.model.encode_image(image, prompt_token)
+
+    ###
+
+
+alpha_test = 1. / 255
+attack_iters_test = 5
+
 def main():
     global best_acc1, device
 
@@ -131,16 +165,37 @@ def main():
         cudnn.deterministic = True
 
     # create model
+
+
     model, preprocess = clip.load('ViT-B/32', device, jit=False, prompt_len=10)
 
-    # print(model.positional_embedding.size())
-    # exit()
+    # model_text = TextCLIP(model)
+    # model_image = ImageCLIP(model)
+    #
+    # model_text = torch.nn.DataParallel(model_text).cuda()
+    # model_image = torch.nn.DataParallel(model_image).cuda()
+    #
+    # convert_models_to_fp32(model_text)
+    # convert_models_to_fp32(model_image)
+    model_text, model_image = None , None
+
+
+
+    # model = torch.nn.parallel.DistributedDataParallel(model).cuda()
+
 
     convert_models_to_fp32(model)
+    model = torch.nn.DataParallel(model) #.to(device)
     model.eval()
 
-    prompter = prompters.__dict__[args.method](args).to(device)
-    add_prompter = TokenPrompter(10).to(device)
+    # model_text.eval()
+    # model_image.eval()
+
+    prompter = prompters.__dict__[args.method](args)  # .to(device)
+    add_prompter = TokenPrompter(10)  # .to(device)
+
+    prompter = torch.nn.DataParallel(prompter).cuda()
+    add_prompter = torch.nn.DataParallel(add_prompter).cuda()
 
     # optionally resume from a checkpoint
     if args.resume:
@@ -167,24 +222,22 @@ def main():
     template = 'This is a photo of a {}'
     print(f'template: {template}')
 
-    print(preprocess, 'preprocess')
+    # print(preprocess, 'preprocess')
     # exit()
 
     # TODO: we can train on cifar10 and test on cifar10, 100 in zero shot way, to see if generalize.
+    preprocess = transforms.Compose([
+        # transforms.RandomHorizontalFlip(),
+        # transforms.RandomRotation(15), # TODO: may use later
+        transforms.ToTensor()
+    ])
 
     if args.dataset == 'cifar100':
 
-
-        transform_ours = transforms.Compose([
-            # transforms.RandomHorizontalFlip(),
-            # transforms.RandomRotation(15), # TODO: may use later
-            transforms.ToTensor()
-        ])
-
-        train_dataset = CIFAR100(args.root, transform=transform_ours,
+        train_dataset = CIFAR100(args.root, transform=preprocess,
                                  download=True, train=True)
 
-        val_dataset = CIFAR100(args.root, transform=transform_ours,
+        val_dataset = CIFAR100(args.root, transform=preprocess,
                                download=True, train=False)
     elif args.dataset == 'cifar10':
         train_dataset = CIFAR10(args.root, transform=preprocess,
@@ -195,7 +248,9 @@ def main():
 
     val_dataset_list=[]
     # val_dataset_name=['cifar10', 'cifar100', 'LSUN', 'STL-10', 'StanfordCars', 'Food101', 'SUN397', ]
-    val_dataset_name = ['cifar10', 'cifar100', 'STL10']
+    # val_dataset_name = ['cifar10', 'cifar100', 'STL10', 'StanfordCars', 'Food101', 'SUN397']
+    val_dataset_name = ['cifar10', 'cifar100']
+    # val_dataset_name = ['cifar10', 'cifar100', 'STL10', 'StanfordCars','SUN397']
     for each in val_dataset_name:
         if each == 'cifar10':
             val_dataset_list.append(CIFAR10(args.root, transform=preprocess,
@@ -209,14 +264,30 @@ def main():
         elif each == 'STL10':
             val_dataset_list.append(STL10(args.root, split='test',
                                                transform=preprocess, download=True))
+        elif each == 'SUN397':
+            val_dataset_list.append(SUN397(args.root,
+                                               transform=preprocess, download=True))
+        elif each == 'StanfordCars':
+            val_dataset_list.append(StanfordCars(args.root, split='test',
+                                           transform=preprocess, download=True))
+        elif each == 'Food101':
+            val_dataset_list.append(Food101(args.root, split='test',
+                                           transform=preprocess, download=True))
+
+    # if args.distributed:
+    #     train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+    #     val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset, shuffle=False, drop_last=True)
+    # else:
+    train_sampler = None
+    val_sampler = None
 
     train_loader = DataLoader(train_dataset,
-                              batch_size=args.batch_size*4, pin_memory=True,
-                              num_workers=args.num_workers, shuffle=True)
+                              batch_size=args.batch_size*8, pin_memory=True,
+                              num_workers=args.num_workers, shuffle=True, sampler=train_sampler)
 
     val_loader_list = [DataLoader(each,
                             batch_size=args.batch_size, pin_memory=True,
-                            num_workers=args.num_workers, shuffle=False) for each in val_dataset_list]
+                            num_workers=args.num_workers, shuffle=False, sampler=val_sampler) for each in val_dataset_list]
 
     class_names = train_dataset.classes
     class_names = refine_classname(class_names)
@@ -268,10 +339,12 @@ def main():
     for epoch in range(args.epochs):
 
         # train for one epoch
-        train(train_loader, texts, model, prompter, add_prompter, optimizer, scheduler, criterion, scaler, epoch, args)
+        train(train_loader, texts, model, model_text, model_image, prompter, add_prompter, optimizer, scheduler,
+              criterion, scaler, epoch, args)
 
         # evaluate on validation set
-        acc1_mean = validate(val_loader_list, val_dataset_name, texts_list, model, prompter, add_prompter, criterion, args)
+        acc1_mean = validate(val_loader_list, val_dataset_name, texts_list, model, model_text, model_image,
+                             prompter, add_prompter, criterion, args)
 
         # remember best acc@1 and save checkpoint
         is_best = acc1_mean > best_acc1
@@ -300,7 +373,7 @@ upper_limit, lower_limit = 1,0
 def clamp(X, lower_limit, upper_limit):
     return torch.max(torch.min(X, upper_limit), lower_limit)
 
-def attack_pgd(prompter, model, add_prompter, criterion, X, target, text_tokens, alpha, attack_iters, norm, restarts=1, early_stop=True):
+def attack_pgd(prompter, model, model_text, model_image, add_prompter, criterion, X, target, text_tokens, alpha, attack_iters, norm, restarts=1, early_stop=True):
 
     delta = torch.zeros_like(X).cuda()
     if norm == "l_inf":
@@ -320,7 +393,19 @@ def attack_pgd(prompter, model, add_prompter, criterion, X, target, text_tokens,
 
         prompted_images = prompter(clip_img_preprocessing(X + delta))
         prompt_token = add_prompter()
-        output, _ = model(prompted_images, text_tokens, prompt_token)
+        # output, _ = model(prompted_images, text_tokens, prompt_token)
+        # print(output.size(), target.size(), 'multi')
+
+        # image_embedding = model_image(prompted_images, prompt_token)
+        # text_embedding = model_text(text_tokens)
+        #
+        # logit_scale = model.logit_scale.exp()
+        # output, _ = create_logits(image_embedding, text_embedding, logit_scale)
+        # print('prompted_images', prompted_images.size(), target.size())
+
+        output, _ = multiGPU_CLIP(model_image, model_text, model, prompted_images, text_tokens, prompt_token)
+
+
         loss = criterion(output, target)
 
 
@@ -342,7 +427,7 @@ def attack_pgd(prompter, model, add_prompter, criterion, X, target, text_tokens,
     return delta
 
 
-def attack_pgd_noprompt(prompter, model, criterion, X, target, text_tokens, alpha, attack_iters, norm, restarts=1, early_stop=True):
+def attack_pgd_noprompt(prompter, model, model_text, model_image, criterion, X, target, text_tokens, alpha, attack_iters, norm, restarts=1, early_stop=True):
 
     delta = torch.zeros_like(X).cuda()
     if norm == "l_inf":
@@ -361,7 +446,10 @@ def attack_pgd_noprompt(prompter, model, criterion, X, target, text_tokens, alph
         # output = model(normalize(X ))
 
         _images = clip_img_preprocessing(X + delta)
-        output, _ = model(_images, text_tokens)
+        # output, _ = model(_images, text_tokens)
+
+        output, _ = multiGPU_CLIP(model_image, model_text, model, _images, text_tokens, None)
+
         loss = criterion(output, target)
 
 
@@ -383,7 +471,55 @@ def attack_pgd_noprompt(prompter, model, criterion, X, target, text_tokens, alph
     return delta
 
 
-def train(train_loader, texts, model, prompter, add_prompter, optimizer, scheduler, criterion, scaler, epoch, args):
+def multiGPU_CLIP(model_image, model_text, model, images, text_tokens, prompt_token=None):
+    # image_embedding = model_image(images, prompt_token)
+    # text_embedding = model_text(text_tokens)
+    #
+    #
+    #
+    # logit_scale = model.logit_scale.exp()
+    img_embed, scale_text_embed = model(images, text_tokens, prompt_token)
+    # print('test len', len(scale_text_embed), scale_text_embed.size())
+    # print('img', img_embed.size())
+    # exit()
+
+    # output, _ = create_logits(image_embedding, text_embedding, logit_scale)
+    logits_per_image = img_embed @ scale_text_embed.t()
+    logits_per_text = scale_text_embed @ img_embed.t()
+    return logits_per_image, logits_per_text
+
+
+# def multiGPU_CLIP(model_image, model_text, model, images, text_tokens, prompt_token=None):
+#     image_embedding = model_image(images, prompt_token)
+#     text_embedding = model_text(text_tokens)
+#
+#     print('image_embedding',images.size(),  len(image_embedding))
+#
+#
+#     logit_scale = model.logit_scale.exp()
+#     output, _ = create_logits(image_embedding, text_embedding, logit_scale)
+#     return output, _
+
+
+# def multiGPU_CLIP(model_image, model_text, model, images, text_tokens, prompt_token=None):
+#     # image_embedding = model_image(images, prompt_token)
+#     # text_embedding = model_text(text_tokens)
+#     #
+#     # print('image_embedding',images.size(), image_embedding.size())
+#
+#     # logit_scale = model.logit_scale.exp()
+#
+#     img_embed, scale_text_embed = model(images, text_tokens, prompt_token)  # [local batch, C]
+#     print(img_embed)
+#
+#     exit()
+#     all_img = all_gather(img_embed)
+#
+#     output, _ = create_logits(image_embedding, text_embedding, logit_scale)
+#     return output, _
+
+
+def train(train_loader, texts, model, model_text, model_image, prompter, add_prompter, optimizer, scheduler, criterion, scaler, epoch, args):
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
@@ -409,6 +545,9 @@ def train(train_loader, texts, model, prompter, add_prompter, optimizer, schedul
         # measure data loading time
         data_time.update(time.time() - end)
 
+        BATCH_SIZE = images.size(0)
+        print('bs', BATCH_SIZE)
+
         # adjust learning rate
         step = num_batches_per_epoch * epoch + i
         scheduler(step)
@@ -424,21 +563,25 @@ def train(train_loader, texts, model, prompter, add_prompter, optimizer, schedul
         # with automatic mixed precision
         with autocast():
 
-            delta = attack_pgd(prompter, model, add_prompter, criterion, images, target, text_tokens, alpha, attack_iters, 'l_inf')
+            delta = attack_pgd(prompter, model, model_text, model_image, add_prompter, criterion, images,
+                               target, text_tokens, alpha, attack_iters, 'l_inf')
             # print('delta', delta.min(), delta.max())
 
             tmp = clip_img_preprocessing(images + delta)
             prompted_images = prompter(tmp)
-            # print('prompt size', prompted_images.size(), tmp.size())
             prompt_token = add_prompter()
-            output, _ = model(prompted_images, text_tokens, prompt_token)
+            # output, _ = model(prompted_images, text_tokens, prompt_token) ## only for single GPU
+
+            # for multiple GPU
+            output, _ = multiGPU_CLIP(model_image, model_text, model, prompted_images, text_tokens, prompt_token)
+
             loss = criterion(output, target)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
         scaler.update()
 
         # Note: we clamp to 4.6052 = ln(100), as in the original paper.
-        model.logit_scale.data = torch.clamp(model.logit_scale.data, 0, 4.6052)
+        model.module.logit_scale.data = torch.clamp(model.module.logit_scale.data, 0, 4.6052)
 
         # measure accuracy
         acc1 = accuracy(output, target, topk=(1,))
@@ -451,7 +594,7 @@ def train(train_loader, texts, model, prompter, add_prompter, optimizer, schedul
 
         if i % args.print_freq == 0:
             progress.display(i)
-            break
+            # break
 
             # if args.use_wandb:
             #     wandb.log({
@@ -471,7 +614,8 @@ def train(train_loader, texts, model, prompter, add_prompter, optimizer, schedul
 
 
 # def validate(val_loader, texts, model, prompter, add_prompter, criterion, args):
-def validate(val_loader_list, val_dataset_name, texts_list, model, prompter, add_prompter, criterion, args):
+def validate(val_loader_list, val_dataset_name, texts_list, model, model_text, model_image,
+             prompter, add_prompter, criterion, args):
 
     dataset_num = len(val_loader_list)
     acc_all = []
@@ -511,8 +655,14 @@ def validate(val_loader_list, val_dataset_name, texts_list, model, prompter, add
             # compute output
             with torch.no_grad():
                 prompt_token = add_prompter()
-                output_prompt, _ = model(prompter(clip_img_preprocessing(images)), text_tokens, prompt_token)
-                output_org, _ = model(clip_img_preprocessing(images), text_tokens)
+                # output_prompt, _ = model(prompter(clip_img_preprocessing(images)), text_tokens, prompt_token)
+                output_prompt, _ = multiGPU_CLIP(model_image, model_text, model,
+                                                 prompter(clip_img_preprocessing(images)), text_tokens, prompt_token)
+
+                # output_org, _ = model(clip_img_preprocessing(images), text_tokens)
+                output_org, _ = multiGPU_CLIP(model_image, model_text, model, clip_img_preprocessing(images),
+                                          text_tokens, None)
+
                 loss = criterion(output_prompt, target)
 
                 # measure accuracy and record loss
@@ -526,23 +676,28 @@ def validate(val_loader_list, val_dataset_name, texts_list, model, prompter, add
 
 
             # generate adv example
-            alpha = 1. / 255
-            attack_iters = 5
-            delta_prompt = attack_pgd(prompter, model, add_prompter, criterion, images, target, text_tokens, alpha, attack_iters, 'l_inf')
+            delta_prompt = attack_pgd(prompter, model, model_text, model_image, add_prompter, criterion, images, target, text_tokens,
+                                      alpha_test, attack_iters_test, 'l_inf')
 
             # compute output
             torch.cuda.empty_cache()
             with torch.no_grad():
                 prompt_token = add_prompter()
-                output_prompt_adv, _ = model(prompter(clip_img_preprocessing(images + delta_prompt)), text_tokens, prompt_token)
+                # output_prompt_adv, _ = model(prompter(clip_img_preprocessing(images + delta_prompt)), text_tokens, prompt_token)
+                output_prompt_adv, _ = multiGPU_CLIP(model_image, model_text, model,
+                                                     prompter(clip_img_preprocessing(images + delta_prompt)), text_tokens, prompt_token)
+
                 loss = criterion(output_prompt_adv, target)
 
             # bl attack
-            delta_noprompt = attack_pgd_noprompt(prompter, model, criterion, images, target, text_tokens, alpha, attack_iters,
+            delta_noprompt = attack_pgd_noprompt(prompter, model, model_text, model_image, criterion, images, target, text_tokens, alpha_test, attack_iters_test,
                                       'l_inf')
             torch.cuda.empty_cache()
             with torch.no_grad():
-                output_org_adv, _ = model(clip_img_preprocessing(images+delta_noprompt), text_tokens)
+                # output_org_adv, _ = model(clip_img_preprocessing(images+delta_noprompt), text_tokens)
+                output_org_adv, _ = multiGPU_CLIP(model_image, model_text, model,
+                                                  clip_img_preprocessing(images + delta_noprompt),
+                                                  text_tokens, None)
 
 
             # measure accuracy and record loss
@@ -559,7 +714,7 @@ def validate(val_loader_list, val_dataset_name, texts_list, model, prompter, add
 
             if i % args.print_freq == 0:
                 progress.display(i)
-                break
+                # break
 
 
         torch.cuda.empty_cache()
