@@ -1,0 +1,6 @@
+ftfy
+regex
+tqdm
+scikit-learn
+matplotlib
+wandb

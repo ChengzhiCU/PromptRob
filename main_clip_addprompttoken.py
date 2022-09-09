@@ -11,7 +11,7 @@ import torch
 import torch.backends.cudnn as cudnn
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
-from torchvision.datasets import CIFAR100, CIFAR10
+from torchvision.datasets import CIFAR100, CIFAR10, Caltech101, STL10
 
 import torchvision.transforms as transforms
 
@@ -22,6 +22,8 @@ from utils import accuracy, AverageMeter, ProgressMeter, save_checkpoint
 from utils import cosine_lr, convert_models_to_fp32, refine_classname
 
 import torch.nn.functional as F
+import numpy as np
+
 
 def parse_option():
     parser = argparse.ArgumentParser('Visual Prompting for CLIP')
@@ -191,17 +193,42 @@ def main():
         val_dataset = CIFAR10(args.root, transform=preprocess,
                                download=True, train=False)
 
+    val_dataset_list=[]
+    # val_dataset_name=['cifar10', 'cifar100', 'LSUN', 'STL-10', 'StanfordCars', 'Food101', 'SUN397', ]
+    val_dataset_name = ['cifar10', 'cifar100', 'STL10']
+    for each in val_dataset_name:
+        if each == 'cifar10':
+            val_dataset_list.append(CIFAR10(args.root, transform=preprocess,
+                               download=True, train=False))
+        elif each == 'cifar100':
+            val_dataset_list.append(CIFAR100(args.root, transform=preprocess,
+                                            download=True, train=False))
+        elif each == 'Caltech101':
+            val_dataset_list.append(Caltech101(args.root, target_type='category', transform=preprocess,
+                                             download=True))
+        elif each == 'STL10':
+            val_dataset_list.append(STL10(args.root, split='test',
+                                               transform=preprocess, download=True))
+
     train_loader = DataLoader(train_dataset,
                               batch_size=args.batch_size*4, pin_memory=True,
                               num_workers=args.num_workers, shuffle=True)
 
-    val_loader = DataLoader(val_dataset,
+    val_loader_list = [DataLoader(each,
                             batch_size=args.batch_size, pin_memory=True,
-                            num_workers=args.num_workers, shuffle=False)
+                            num_workers=args.num_workers, shuffle=False) for each in val_dataset_list]
 
     class_names = train_dataset.classes
     class_names = refine_classname(class_names)
     texts = [template.format(label) for label in class_names]
+
+    texts_list = []
+    for each in val_dataset_list:
+        class_names = each.classes
+        class_names = refine_classname(class_names)
+        texts = [template.format(label) for label in class_names]
+        texts_list.append(texts)
+
 
     # define criterion and optimizer
     optimizer = torch.optim.SGD(list(prompter.parameters())+list(add_prompter.parameters()),
@@ -232,7 +259,8 @@ def main():
     #     wandb.watch(prompter, criterion, log='all', log_freq=10)
 
     if args.evaluate:
-        acc1 = validate(val_loader, texts, model, prompter, criterion, args)
+        acc1_mean = validate(val_loader_list, val_dataset_name, texts_list, model, prompter, add_prompter, criterion,
+                             args)
         return
 
     epochs_since_improvement = 0
@@ -243,11 +271,11 @@ def main():
         train(train_loader, texts, model, prompter, add_prompter, optimizer, scheduler, criterion, scaler, epoch, args)
 
         # evaluate on validation set
-        acc1 = validate(val_loader, texts, model, prompter, add_prompter, criterion, args)
+        acc1_mean = validate(val_loader_list, val_dataset_name, texts_list, model, prompter, add_prompter, criterion, args)
 
         # remember best acc@1 and save checkpoint
-        is_best = acc1 > best_acc1
-        best_acc1 = max(acc1, best_acc1)
+        is_best = acc1_mean > best_acc1
+        best_acc1 = max(acc1_mean, best_acc1)
 
         save_checkpoint({
             'epoch': epoch + 1,
@@ -423,7 +451,7 @@ def train(train_loader, texts, model, prompter, add_prompter, optimizer, schedul
 
         if i % args.print_freq == 0:
             progress.display(i)
-            # break
+            break
 
             # if args.use_wandb:
             #     wandb.log({
@@ -442,89 +470,105 @@ def train(train_loader, texts, model, prompter, add_prompter, optimizer, schedul
     return losses.avg, top1.avg
 
 
-def validate(val_loader, texts, model, prompter, add_prompter, criterion, args):
-    batch_time = AverageMeter('Time', ':6.3f')
-    losses = AverageMeter('Loss', ':.4e')
-    top1_org = AverageMeter('Original Acc@1', ':6.2f')
-    top1_prompt = AverageMeter('Prompt Acc@1', ':6.2f')
-    top1_adv_org = AverageMeter('Adv Original Acc@1', ':6.2f')
-    top1_adv_prompt = AverageMeter('Adv Prompt Acc@1', ':6.2f')
+# def validate(val_loader, texts, model, prompter, add_prompter, criterion, args):
+def validate(val_loader_list, val_dataset_name, texts_list, model, prompter, add_prompter, criterion, args):
 
-    progress = ProgressMeter(
-        len(val_loader),
-        [batch_time, losses, top1_org, top1_prompt, top1_adv_org, top1_adv_prompt],
-        prefix='Validate: ')
+    dataset_num = len(val_loader_list)
+    acc_all = []
 
-    # switch to evaluation mode
-    prompter.eval()
+    for cnt in range(dataset_num):
 
-    #
-    end = time.time()
-    for i, (images, target) in enumerate(tqdm(val_loader)):
+        val_loader = val_loader_list[cnt]
+        texts = texts_list[cnt]
+        dataset_name = val_dataset_name[cnt]
 
-        images = images.to(device)
-        target = target.to(device)
-        text_tokens = clip.tokenize(texts).to(device)
 
-        # clean images, with prompt and without prompt
-        # compute output
-        with torch.no_grad():
-            prompt_token = add_prompter()
-            output_prompt, _ = model(prompter(clip_img_preprocessing(images)), text_tokens, prompt_token)
-            output_org, _ = model(clip_img_preprocessing(images), text_tokens)
-            loss = criterion(output_prompt, target)
+        batch_time = AverageMeter('Time', ':6.3f')
+        losses = AverageMeter('Loss', ':.4e')
+        top1_org = AverageMeter('Original Acc@1', ':6.2f')
+        top1_prompt = AverageMeter('Prompt Acc@1', ':6.2f')
+        top1_adv_org = AverageMeter('Adv Original Acc@1', ':6.2f')
+        top1_adv_prompt = AverageMeter('Adv Prompt Acc@1', ':6.2f')
+
+        progress = ProgressMeter(
+            len(val_loader),
+            [batch_time, losses, top1_org, top1_prompt, top1_adv_org, top1_adv_prompt],
+            prefix=dataset_name + '_Validate: ')
+
+        # switch to evaluation mode
+        prompter.eval()
+        add_prompter.eval()
+
+        #
+        end = time.time()
+        for i, (images, target) in enumerate(tqdm(val_loader)):
+
+            images = images.to(device)
+            target = target.to(device)
+            text_tokens = clip.tokenize(texts).to(device)
+
+            # clean images, with prompt and without prompt
+            # compute output
+            with torch.no_grad():
+                prompt_token = add_prompter()
+                output_prompt, _ = model(prompter(clip_img_preprocessing(images)), text_tokens, prompt_token)
+                output_org, _ = model(clip_img_preprocessing(images), text_tokens)
+                loss = criterion(output_prompt, target)
+
+                # measure accuracy and record loss
+                acc1 = accuracy(output_prompt, target, topk=(1,))
+                losses.update(loss.item(), images.size(0))
+                top1_prompt.update(acc1[0].item(), images.size(0))
+
+                acc1 = accuracy(output_org, target, topk=(1,))
+                top1_org.update(acc1[0].item(), images.size(0))
+
+
+
+            # generate adv example
+            alpha = 1. / 255
+            attack_iters = 5
+            delta_prompt = attack_pgd(prompter, model, add_prompter, criterion, images, target, text_tokens, alpha, attack_iters, 'l_inf')
+
+            # compute output
+            torch.cuda.empty_cache()
+            with torch.no_grad():
+                prompt_token = add_prompter()
+                output_prompt_adv, _ = model(prompter(clip_img_preprocessing(images + delta_prompt)), text_tokens, prompt_token)
+                loss = criterion(output_prompt_adv, target)
+
+            # bl attack
+            delta_noprompt = attack_pgd_noprompt(prompter, model, criterion, images, target, text_tokens, alpha, attack_iters,
+                                      'l_inf')
+            torch.cuda.empty_cache()
+            with torch.no_grad():
+                output_org_adv, _ = model(clip_img_preprocessing(images+delta_noprompt), text_tokens)
+
 
             # measure accuracy and record loss
-            acc1 = accuracy(output_prompt, target, topk=(1,))
+            acc1 = accuracy(output_prompt_adv, target, topk=(1,))
             losses.update(loss.item(), images.size(0))
-            top1_prompt.update(acc1[0].item(), images.size(0))
+            top1_adv_prompt.update(acc1[0].item(), images.size(0))
 
-            acc1 = accuracy(output_org, target, topk=(1,))
-            top1_org.update(acc1[0].item(), images.size(0))
+            acc1 = accuracy(output_org_adv, target, topk=(1,))
+            top1_adv_org.update(acc1[0].item(), images.size(0))
+
+            # measure elapsed time
+            batch_time.update(time.time() - end)
+            end = time.time()
+
+            if i % args.print_freq == 0:
+                progress.display(i)
+                break
 
 
-
-        # generate adv example
-        alpha = 1. / 255
-        attack_iters = 5
-        delta_prompt = attack_pgd(prompter, model, add_prompter, criterion, images, target, text_tokens, alpha, attack_iters, 'l_inf')
-
-        # compute output
         torch.cuda.empty_cache()
-        with torch.no_grad():
-            prompt_token = add_prompter()
-            output_prompt_adv, _ = model(prompter(clip_img_preprocessing(images + delta_prompt)), text_tokens, prompt_token)
-            loss = criterion(output_prompt_adv, target)
 
-        # bl attack
-        delta_noprompt = attack_pgd_noprompt(prompter, model, criterion, images, target, text_tokens, alpha, attack_iters,
-                                  'l_inf')
-        torch.cuda.empty_cache()
-        with torch.no_grad():
-            output_org_adv, _ = model(clip_img_preprocessing(images+delta_noprompt), text_tokens)
-
-
-        # measure accuracy and record loss
-        acc1 = accuracy(output_prompt_adv, target, topk=(1,))
-        losses.update(loss.item(), images.size(0))
-        top1_adv_prompt.update(acc1[0].item(), images.size(0))
-
-        acc1 = accuracy(output_org_adv, target, topk=(1,))
-        top1_adv_org.update(acc1[0].item(), images.size(0))
-
-        # measure elapsed time
-        batch_time.update(time.time() - end)
-        end = time.time()
-
-        if i % args.print_freq == 0:
-            progress.display(i)
-            # break
-    torch.cuda.empty_cache()
-
-    print(' * Adv Prompt Acc@1 {top1_adv_prompt.avg:.3f} Adv Original Acc@1 {top1_adv_org.avg:.3f} '
-          '*  Prompt Acc@1 {top1_prompt.avg:.3f} Original Acc@1 {top1_org.avg:.3f}'
-          .format(top1_adv_prompt=top1_adv_prompt, top1_adv_org=top1_adv_org,
-                  top1_prompt=top1_prompt, top1_org=top1_org))
+        print(dataset_name + ' * Adv Prompt Acc@1 {top1_adv_prompt.avg:.3f} Adv Original Acc@1 {top1_adv_org.avg:.3f} '
+              '*  Prompt Acc@1 {top1_prompt.avg:.3f} Original Acc@1 {top1_org.avg:.3f}'
+              .format(top1_adv_prompt=top1_adv_prompt, top1_adv_org=top1_adv_org,
+                      top1_prompt=top1_prompt, top1_org=top1_org))
+        acc_all.append(top1_adv_prompt.avg)
 
     # if args.use_wandb:
     #     wandb.log({
@@ -533,7 +577,7 @@ def validate(val_loader, texts, model, prompter, add_prompter, criterion, args):
     #         'val_acc_org': top1_org.avg,
     #     })
 
-    return top1_prompt.avg
+    return np.mean(acc_all)
 
 
 if __name__ == '__main__':
