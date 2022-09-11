@@ -11,9 +11,15 @@ Caltech 101,
 ImageNet,
 
 
+CUDA_VISIBLE_DEVICES=5,6 python main_clip_addprompttoken.py --dataset cifar100 --root /local/vondrick/chengzhi/datasets --add_prompt_size 0
+
 # compare inside prompt vs. outside token prompt.
 
 # get multiGPU work
+
+https://github.com/openai/CLIP/issues/111
+
+### Find the visual prompt is fiting to the one hot embed, not the text. Which will cause overfit to one hot and lost ability to be zero shot.
 
 # Visual Prompting
 This is the official implementation of the paper [Exploring Visual Prompts for Adapting Large-Scale Models](https://arxiv.org/abs/2203.17274). 
