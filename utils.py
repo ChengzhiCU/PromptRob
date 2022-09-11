@@ -104,3 +104,18 @@ class ProgressMeter(object):
         num_digits = len(str(num_batches // 1))
         fmt = '{:' + str(num_digits) + 'd}'
         return '[' + fmt + '/' + fmt.format(num_batches) + ']'
+
+
+def load_imagenet_folder2name(path):
+    dict_imagenet_folder2name = {}
+    with open(path) as f:
+        line = f.readline()
+        while line:
+            split_name = line.strip().split()
+            cat_name = split_name[2]
+            id = split_name[0]
+            dict_imagenet_folder2name[id] = cat_name
+            line = f.readline()
+    print(dict_imagenet_folder2name)
+    return dict_imagenet_folder2name
+

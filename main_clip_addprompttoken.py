@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader
 from torchvision.datasets import CIFAR100, CIFAR10, Caltech101, STL10,  StanfordCars, Food101, SUN397
 
 import torchvision.transforms as transforms
+import torchvision
 
 import clip
 from models import prompters
@@ -28,10 +29,12 @@ import torch.nn as nn
 def parse_option():
     parser = argparse.ArgumentParser('Visual Prompting for CLIP')
 
-    parser.add_argument('--print_freq', type=int, default=100,
+    parser.add_argument('--print_freq', type=int, default=20,
                         help='print frequency')
     parser.add_argument('--save_freq', type=int, default=50,
                         help='save frequency')
+    parser.add_argument('--validate_freq', type=int, default=10,
+                        help='validate frequency')
     parser.add_argument('--batch_size', type=int, default=16,
                         help='batch_size')
     parser.add_argument('--num_workers', type=int, default=16,
@@ -42,7 +45,7 @@ def parse_option():
     # optimization
     parser.add_argument('--optim', type=str, default='sgd',
                         help='optimizer to use')
-    parser.add_argument('--learning_rate', type=float, default=40,
+    parser.add_argument('--learning_rate', type=float, default=40,  ## Why so large
                         help='learning rate')
     parser.add_argument("--weight_decay", type=float, default=0,
                         help="weight decay")
@@ -60,6 +63,8 @@ def parse_option():
                         help='choose visual prompting method')
     parser.add_argument('--prompt_size', type=int, default=30,
                         help='size for visual prompts')
+    parser.add_argument('--add_prompt_size', type=int, default=10,
+                        help='size for additional visual prompts')
 
     # dataset
     parser.add_argument('--root', type=str, default='./data',
@@ -87,15 +92,16 @@ def parse_option():
                         help='evaluate model test set')
     parser.add_argument('--gpu', type=int, default=None,
                         help='gpu to use')
+    parser.add_argument('--debug', action='store_true')
     # parser.add_argument('--use_wandb', default=False,
     #                     action="store_true",
     #                     help='whether to use wandb')
 
     args = parser.parse_args()
 
-    args.filename = '{}_{}_{}_{}_{}_{}_lr_{}_decay_{}_bsz_{}_warmup_{}_trial_{}'. \
+    args.filename = '{}_{}_{}_{}_{}_{}_lr_{}_decay_{}_bsz_{}_warmup_{}_trial_{}_addp_{}'. \
         format(args.method, args.prompt_size, args.dataset, args.model, args.arch,
-               args.optim, args.learning_rate, args.weight_decay, args.batch_size, args.warmup, args.trial)
+               args.optim, args.learning_rate, args.weight_decay, args.batch_size, args.warmup, args.trial, args.add_prompt_size)
 
     return args
 
@@ -153,6 +159,11 @@ class ImageCLIP(nn.Module):
 alpha_test = 1. / 255
 attack_iters_test = 5
 
+epsilon = 2./255
+upper_limit, lower_limit = 1,0
+
+
+
 def main():
     global best_acc1, device
 
@@ -164,10 +175,13 @@ def main():
         torch.manual_seed(args.seed)
         cudnn.deterministic = True
 
+    imagenet_root = '/local/vondrick/datasets/ImageNet-clean'
+
+
     # create model
+    add_prompt_len=args.add_prompt_size
 
-
-    model, preprocess = clip.load('ViT-B/32', device, jit=False, prompt_len=10)
+    model, preprocess = clip.load('ViT-B/32', device, jit=False, prompt_len=add_prompt_len)
 
     # model_text = TextCLIP(model)
     # model_image = ImageCLIP(model)
@@ -192,7 +206,7 @@ def main():
     # model_image.eval()
 
     prompter = prompters.__dict__[args.method](args)  # .to(device)
-    add_prompter = TokenPrompter(10)  # .to(device)
+    add_prompter = TokenPrompter(add_prompt_len)  # .to(device)
 
     prompter = torch.nn.DataParallel(prompter).cuda()
     add_prompter = torch.nn.DataParallel(add_prompter).cuda()
@@ -231,6 +245,13 @@ def main():
         # transforms.RandomRotation(15), # TODO: may use later
         transforms.ToTensor()
     ])
+    preprocess224 = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        # transforms.RandomHorizontalFlip(),
+        # transforms.RandomRotation(15), # TODO: may use later
+        transforms.ToTensor()
+    ])
 
     if args.dataset == 'cifar100':
 
@@ -246,11 +267,27 @@ def main():
         val_dataset = CIFAR10(args.root, transform=preprocess,
                                download=True, train=False)
 
+    elif args.dataset == 'ImageNet':
+        train_dataset = torchvision.datasets.ImageFolder(
+            os.path.join(imagenet_root, 'train'),
+            transform=preprocess224
+        )
+
+        # train_dataset = torchvision.datasets.ImageFolder(
+        #     root=imagenet_root,
+        #     split='train',
+        #     transform=transforms.Compose([
+        #         transforms.RandomResizedCrop(224),
+        #         transforms.RandomHorizontalFlip(),
+        #         transforms.ToTensor(),
+        #     ]))
+
     val_dataset_list=[]
     # val_dataset_name=['cifar10', 'cifar100', 'LSUN', 'STL-10', 'StanfordCars', 'Food101', 'SUN397', ]
     # val_dataset_name = ['cifar10', 'cifar100', 'STL10', 'StanfordCars', 'Food101', 'SUN397']
-    val_dataset_name = ['cifar10', 'cifar100']
-    # val_dataset_name = ['cifar10', 'cifar100', 'STL10', 'StanfordCars','SUN397']
+    val_dataset_name = ['cifar10', 'cifar100', 'STL-10', 'SUN397']
+    val_dataset_name = ['SUN397', 'StanfordCars', 'Food101']
+    val_dataset_name = ['ImageNet', 'cifar10', 'cifar100',  'STL10', 'StanfordCars','SUN397']
     for each in val_dataset_name:
         if each == 'cifar10':
             val_dataset_list.append(CIFAR10(args.root, transform=preprocess,
@@ -259,20 +296,29 @@ def main():
             val_dataset_list.append(CIFAR100(args.root, transform=preprocess,
                                             download=True, train=False))
         elif each == 'Caltech101':
-            val_dataset_list.append(Caltech101(args.root, target_type='category', transform=preprocess,
+            val_dataset_list.append(Caltech101(args.root, target_type='category', transform=preprocess224,
                                              download=True))
         elif each == 'STL10':
             val_dataset_list.append(STL10(args.root, split='test',
                                                transform=preprocess, download=True))
         elif each == 'SUN397':
             val_dataset_list.append(SUN397(args.root,
-                                               transform=preprocess, download=True))
+                                               transform=preprocess224, download=True))
         elif each == 'StanfordCars':
             val_dataset_list.append(StanfordCars(args.root, split='test',
-                                           transform=preprocess, download=True))
+                                           transform=preprocess224, download=True))
         elif each == 'Food101':
             val_dataset_list.append(Food101(args.root, split='test',
-                                           transform=preprocess, download=True))
+                                           transform=preprocess224, download=True))
+        elif each == 'ImageNet':
+            val_dataset_list.append(torchvision.datasets.ImageFolder(
+            os.path.join(imagenet_root, 'val'),
+            transform=preprocess224))
+            
+            # val_dataset_list.append(torchvision.datasets.ImageNet(
+            # root=imagenet_root,
+            # split='val',
+            # transform=preprocess224))
 
     # if args.distributed:
     #     train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
@@ -290,15 +336,33 @@ def main():
                             num_workers=args.num_workers, shuffle=False, sampler=val_sampler) for each in val_dataset_list]
 
     class_names = train_dataset.classes
+
+    if args.dataset == 'ImageNet':
+        from utils import load_imagenet_folder2name
+        folder2name = load_imagenet_folder2name('imagenet_classes_names.txt')
+        new_class_names = []
+        for each in class_names:
+            new_class_names.append(folder2name[each])
+        
+        class_names = new_class_names
+
     class_names = refine_classname(class_names)
-    texts = [template.format(label) for label in class_names]
+    texts_train = [template.format(label) for label in class_names]
 
     texts_list = []
-    for each in val_dataset_list:
+    for cnt, each in enumerate(val_dataset_list):
         class_names = each.classes
+        if val_dataset_name[cnt] == 'ImageNet':
+            from utils import load_imagenet_folder2name
+            folder2name = load_imagenet_folder2name('imagenet_classes_names.txt')
+            new_class_names = []
+            for each in class_names:
+                new_class_names.append(folder2name[each])
+            class_names = new_class_names
+
         class_names = refine_classname(class_names)
-        texts = [template.format(label) for label in class_names]
-        texts_list.append(texts)
+        texts_tmp = [template.format(label) for label in class_names]
+        texts_list.append(texts_tmp)
 
 
     # define criterion and optimizer
@@ -339,12 +403,13 @@ def main():
     for epoch in range(args.epochs):
 
         # train for one epoch
-        train(train_loader, texts, model, model_text, model_image, prompter, add_prompter, optimizer, scheduler,
+        train(train_loader, texts_train, model, model_text, model_image, prompter, add_prompter, optimizer, scheduler,
               criterion, scaler, epoch, args)
 
         # evaluate on validation set
-        acc1_mean = validate(val_loader_list, val_dataset_name, texts_list, model, model_text, model_image,
-                             prompter, add_prompter, criterion, args)
+        if epoch % args.validate_freq == 0:
+            acc1_mean = validate(val_loader_list, val_dataset_name, texts_list, model, model_text, model_image,
+                                prompter, add_prompter, criterion, args)
 
         # remember best acc@1 and save checkpoint
         is_best = acc1_mean > best_acc1
@@ -368,8 +433,7 @@ def main():
                 break
 
     # wandb.run.finish()
-epsilon = 2./255
-upper_limit, lower_limit = 1,0
+
 def clamp(X, lower_limit, upper_limit):
     return torch.max(torch.min(X, upper_limit), lower_limit)
 
@@ -546,7 +610,7 @@ def train(train_loader, texts, model, model_text, model_image, prompter, add_pro
         data_time.update(time.time() - end)
 
         BATCH_SIZE = images.size(0)
-        print('bs', BATCH_SIZE)
+        # print('bs', BATCH_SIZE)
 
         # adjust learning rate
         step = num_batches_per_epoch * epoch + i
@@ -594,6 +658,8 @@ def train(train_loader, texts, model, model_text, model_image, prompter, add_pro
 
         if i % args.print_freq == 0:
             progress.display(i)
+            if args.debug:
+                break
             # break
 
             # if args.use_wandb:
@@ -643,70 +709,83 @@ def validate(val_loader_list, val_dataset_name, texts_list, model, model_text, m
         prompter.eval()
         add_prompter.eval()
 
+        # print(val_dataset_name, 'text token', texts_list)
+
         #
         end = time.time()
         for i, (images, target) in enumerate(tqdm(val_loader)):
+
+            if 'cifar' not in val_dataset_name:
+                if i%20 != 0:
+                    continue
 
             images = images.to(device)
             target = target.to(device)
             text_tokens = clip.tokenize(texts).to(device)
 
-            # clean images, with prompt and without prompt
-            # compute output
-            with torch.no_grad():
-                prompt_token = add_prompter()
-                # output_prompt, _ = model(prompter(clip_img_preprocessing(images)), text_tokens, prompt_token)
-                output_prompt, _ = multiGPU_CLIP(model_image, model_text, model,
-                                                 prompter(clip_img_preprocessing(images)), text_tokens, prompt_token)
+            # print(images.size())
 
-                # output_org, _ = model(clip_img_preprocessing(images), text_tokens)
-                output_org, _ = multiGPU_CLIP(model_image, model_text, model, clip_img_preprocessing(images),
-                                          text_tokens, None)
+            with autocast():
 
-                loss = criterion(output_prompt, target)
+                # clean images, with prompt and without prompt
+                # compute output
+                with torch.no_grad():
+                    prompt_token = add_prompter()
+                    # output_prompt, _ = model(prompter(clip_img_preprocessing(images)), text_tokens, prompt_token)
+                    output_prompt, _ = multiGPU_CLIP(model_image, model_text, model,
+                                                    prompter(clip_img_preprocessing(images)), text_tokens, prompt_token)
 
+                    # output_org, _ = model(clip_img_preprocessing(images), text_tokens)
+                    output_org, _ = multiGPU_CLIP(model_image, model_text, model, clip_img_preprocessing(images),
+                                            text_tokens, None)
+
+                    loss = criterion(output_prompt, target)
+
+                    # measure accuracy and record loss
+                    acc1 = accuracy(output_prompt, target, topk=(1,))
+                    losses.update(loss.item(), images.size(0))
+                    top1_prompt.update(acc1[0].item(), images.size(0))
+
+                    acc1 = accuracy(output_org, target, topk=(1,))
+                    top1_org.update(acc1[0].item(), images.size(0))
+
+                torch.cuda.empty_cache()
+
+                # generate adv example
+                delta_prompt = attack_pgd(prompter, model, model_text, model_image, add_prompter, criterion, images, target, text_tokens,
+                                        alpha_test, attack_iters_test, 'l_inf')
+
+
+                # compute output
+                torch.cuda.empty_cache()
+                with torch.no_grad():
+                    prompt_token = add_prompter()
+                    # output_prompt_adv, _ = model(prompter(clip_img_preprocessing(images + delta_prompt)), text_tokens, prompt_token)
+                    output_prompt_adv, _ = multiGPU_CLIP(model_image, model_text, model,
+                                                        prompter(clip_img_preprocessing(images + delta_prompt)), text_tokens, prompt_token)
+
+                    loss = criterion(output_prompt_adv, target)
+
+                # bl attack
+                torch.cuda.empty_cache()
+
+                delta_noprompt = attack_pgd_noprompt(prompter, model, model_text, model_image, criterion, images, target, text_tokens, alpha_test, attack_iters_test,
+                                        'l_inf')
+                torch.cuda.empty_cache()
+                with torch.no_grad():
+                    # output_org_adv, _ = model(clip_img_preprocessing(images+delta_noprompt), text_tokens)
+                    output_org_adv, _ = multiGPU_CLIP(model_image, model_text, model,
+                                                    clip_img_preprocessing(images + delta_noprompt),
+                                                    text_tokens, None)
+
+                torch.cuda.empty_cache()
                 # measure accuracy and record loss
-                acc1 = accuracy(output_prompt, target, topk=(1,))
+                acc1 = accuracy(output_prompt_adv, target, topk=(1,))
                 losses.update(loss.item(), images.size(0))
-                top1_prompt.update(acc1[0].item(), images.size(0))
+                top1_adv_prompt.update(acc1[0].item(), images.size(0))
 
-                acc1 = accuracy(output_org, target, topk=(1,))
-                top1_org.update(acc1[0].item(), images.size(0))
-
-
-
-            # generate adv example
-            delta_prompt = attack_pgd(prompter, model, model_text, model_image, add_prompter, criterion, images, target, text_tokens,
-                                      alpha_test, attack_iters_test, 'l_inf')
-
-            # compute output
-            torch.cuda.empty_cache()
-            with torch.no_grad():
-                prompt_token = add_prompter()
-                # output_prompt_adv, _ = model(prompter(clip_img_preprocessing(images + delta_prompt)), text_tokens, prompt_token)
-                output_prompt_adv, _ = multiGPU_CLIP(model_image, model_text, model,
-                                                     prompter(clip_img_preprocessing(images + delta_prompt)), text_tokens, prompt_token)
-
-                loss = criterion(output_prompt_adv, target)
-
-            # bl attack
-            delta_noprompt = attack_pgd_noprompt(prompter, model, model_text, model_image, criterion, images, target, text_tokens, alpha_test, attack_iters_test,
-                                      'l_inf')
-            torch.cuda.empty_cache()
-            with torch.no_grad():
-                # output_org_adv, _ = model(clip_img_preprocessing(images+delta_noprompt), text_tokens)
-                output_org_adv, _ = multiGPU_CLIP(model_image, model_text, model,
-                                                  clip_img_preprocessing(images + delta_noprompt),
-                                                  text_tokens, None)
-
-
-            # measure accuracy and record loss
-            acc1 = accuracy(output_prompt_adv, target, topk=(1,))
-            losses.update(loss.item(), images.size(0))
-            top1_adv_prompt.update(acc1[0].item(), images.size(0))
-
-            acc1 = accuracy(output_org_adv, target, topk=(1,))
-            top1_adv_org.update(acc1[0].item(), images.size(0))
+                acc1 = accuracy(output_org_adv, target, topk=(1,))
+                top1_adv_org.update(acc1[0].item(), images.size(0))
 
             # measure elapsed time
             batch_time.update(time.time() - end)
@@ -714,7 +793,9 @@ def validate(val_loader_list, val_dataset_name, texts_list, model, model_text, m
 
             if i % args.print_freq == 0:
                 progress.display(i)
-                # break
+                if args.debug:
+                    break
+
 
 
         torch.cuda.empty_cache()
