@@ -11,8 +11,8 @@ import torch
 import torch.backends.cudnn as cudnn
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
-from torchvision.datasets import CIFAR100, CIFAR10, Caltech101, STL10, StanfordCars, Food101, SUN397
-# from torchvision.datasets import CIFAR100, CIFAR10
+# from torchvision.datasets import CIFAR100, CIFAR10, Caltech101, STL10, StanfordCars, Food101, SUN397
+from torchvision.datasets import CIFAR100, CIFAR10
 
 import torchvision.transforms as transforms
 import torchvision
@@ -299,8 +299,8 @@ def main():
                                             download=True, train=False))
         elif each == 'zeroshot_cifar100':
             assert args.dataset == 'zeroshot_cifar100'
-            val_dataset_list.append = CLASS_SPLIT_CIFAR100(args.root, transform=preprocess,
-                               download=True, train=False, train_class_count=train_class_count)
+            val_dataset_list.append(CLASS_SPLIT_CIFAR100(args.root, transform=preprocess,
+                               download=True, train=False, train_class_count=train_class_count))
         elif each == 'Caltech101':
             val_dataset_list.append(Caltech101(args.root, target_type='category', transform=preprocess224,
                                              download=True))
