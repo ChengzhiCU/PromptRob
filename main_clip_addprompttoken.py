@@ -11,7 +11,8 @@ import torch
 import torch.backends.cudnn as cudnn
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
-from torchvision.datasets import CIFAR100, CIFAR10, Caltech101, STL10,  StanfordCars, Food101, SUN397
+from torchvision.datasets import CIFAR100, CIFAR10, Caltech101, STL10, StanfordCars, Food101, SUN397
+# from torchvision.datasets import CIFAR100, CIFAR10
 
 import torchvision.transforms as transforms
 import torchvision
@@ -19,7 +20,7 @@ import torchvision
 import clip
 from models import prompters
 from models.prompters import TokenPrompter
-from utils import accuracy, AverageMeter, ProgressMeter, save_checkpoint
+from utils import CLASS_SPLIT_CIFAR100, accuracy, AverageMeter, ProgressMeter, save_checkpoint
 from utils import cosine_lr, convert_models_to_fp32, refine_classname
 
 import torch.nn.functional as F
@@ -153,15 +154,12 @@ class ImageCLIP(nn.Module):
     def forward(self, image, prompt_token=None):
         return self.model.encode_image(image, prompt_token)
 
-    ###
-
 
 alpha_test = 1. / 255
 attack_iters_test = 5
 
 epsilon = 2./255
 upper_limit, lower_limit = 1,0
-
 
 
 def main():
@@ -177,33 +175,28 @@ def main():
 
     imagenet_root = '/local/vondrick/datasets/ImageNet-clean'
 
-
     # create model
     add_prompt_len=args.add_prompt_size
 
     model, preprocess = clip.load('ViT-B/32', device, jit=False, prompt_len=add_prompt_len)
+    convert_models_to_fp32(model)
 
-    # model_text = TextCLIP(model)
-    # model_image = ImageCLIP(model)
-    #
-    # model_text = torch.nn.DataParallel(model_text).cuda()
-    # model_image = torch.nn.DataParallel(model_image).cuda()
-    #
-    # convert_models_to_fp32(model_text)
-    # convert_models_to_fp32(model_image)
-    model_text, model_image = None , None
-
-
+    model_text = TextCLIP(model)
+    model_image = ImageCLIP(model)
+    
+    model_text = torch.nn.DataParallel(model_text)
+    model_image = torch.nn.DataParallel(model_image)
+    
+    convert_models_to_fp32(model_text)
+    convert_models_to_fp32(model_image)
+    # model_text, model_image = None, None
 
     # model = torch.nn.parallel.DistributedDataParallel(model).cuda()
 
-
-    convert_models_to_fp32(model)
-    model = torch.nn.DataParallel(model) #.to(device)
+    # model = torch.nn.DataParallel(model) #.to(device)
     model.eval()
-
-    # model_text.eval()
-    # model_image.eval()
+    model_text.eval()
+    model_image.eval()
 
     prompter = prompters.__dict__[args.method](args)  # .to(device)
     add_prompter = TokenPrompter(add_prompt_len)  # .to(device)
@@ -254,7 +247,6 @@ def main():
     ])
 
     if args.dataset == 'cifar100':
-
         train_dataset = CIFAR100(args.root, transform=preprocess,
                                  download=True, train=True)
 
@@ -273,6 +265,14 @@ def main():
             transform=preprocess224
         )
 
+    elif args.dataset == 'zeroshot_cifar100':
+        train_class_count = 50
+        train_dataset = CLASS_SPLIT_CIFAR100(args.root, transform=preprocess,
+                                 download=True, train=True, train_class_count=train_class_count)
+ 
+        val_dataset = CLASS_SPLIT_CIFAR100(args.root, transform=preprocess,
+                               download=True, train=False, train_class_count=train_class_count)
+
         # train_dataset = torchvision.datasets.ImageFolder(
         #     root=imagenet_root,
         #     split='train',
@@ -288,6 +288,8 @@ def main():
     val_dataset_name = ['cifar10', 'cifar100', 'STL-10', 'SUN397']
     val_dataset_name = ['SUN397', 'StanfordCars', 'Food101']
     val_dataset_name = ['ImageNet', 'cifar10', 'cifar100',  'STL10', 'StanfordCars','SUN397']
+    val_dataset_name = ['zeroshot_cifar100', 'cifar10']
+
     for each in val_dataset_name:
         if each == 'cifar10':
             val_dataset_list.append(CIFAR10(args.root, transform=preprocess,
@@ -295,6 +297,10 @@ def main():
         elif each == 'cifar100':
             val_dataset_list.append(CIFAR100(args.root, transform=preprocess,
                                             download=True, train=False))
+        elif each == 'zeroshot_cifar100':
+            assert args.dataset == 'zeroshot_cifar100'
+            val_dataset_list.append = CLASS_SPLIT_CIFAR100(args.root, transform=preprocess,
+                               download=True, train=False, train_class_count=train_class_count)
         elif each == 'Caltech101':
             val_dataset_list.append(Caltech101(args.root, target_type='category', transform=preprocess224,
                                              download=True))
@@ -469,9 +475,7 @@ def attack_pgd(prompter, model, model_text, model_image, add_prompter, criterion
 
         output, _ = multiGPU_CLIP(model_image, model_text, model, prompted_images, text_tokens, prompt_token)
 
-
         loss = criterion(output, target)
-
 
         loss.backward()
         grad = delta.grad.detach()
@@ -534,24 +538,29 @@ def attack_pgd_noprompt(prompter, model, model_text, model_image, criterion, X, 
 
     return delta
 
-
 def multiGPU_CLIP(model_image, model_text, model, images, text_tokens, prompt_token=None):
-    # image_embedding = model_image(images, prompt_token)
-    # text_embedding = model_text(text_tokens)
-    #
-    #
-    #
-    # logit_scale = model.logit_scale.exp()
-    img_embed, scale_text_embed = model(images, text_tokens, prompt_token)
-    # print('test len', len(scale_text_embed), scale_text_embed.size())
-    # print('img', img_embed.size())
-    # exit()
+    image_features = model_image(images, prompt_token=prompt_token)
+    text_features = model_text(text_tokens)
 
-    # output, _ = create_logits(image_embedding, text_embedding, logit_scale)
-    logits_per_image = img_embed @ scale_text_embed.t()
-    logits_per_text = scale_text_embed @ img_embed.t()
+    image_features = image_features / image_features.norm(dim=1, keepdim=True)
+    text_features = text_features / text_features.norm(dim=1, keepdim=True)
+    logit_scale = model.logit_scale.exp()
+    scaled_text_features = logit_scale * text_features
+
+    logits_per_image = image_features @ scaled_text_features.t()
+    logits_per_text = scaled_text_features @ image_features.t()
     return logits_per_image, logits_per_text
 
+# def multiGPU_CLIP(model_image, model_text, model, images, text_tokens, prompt_token=None):
+#     img_embed, scale_text_embed = model(images, text_tokens, prompt_token)
+#     # print('test len', len(scale_text_embed), scale_text_embed.size())
+#     # print('img', img_embed.size())
+#     # exit()
+
+#     # output, _ = create_logits(image_embedding, text_embedding, logit_scale)
+#     logits_per_image = img_embed @ scale_text_embed.t()
+#     logits_per_text = scale_text_embed @ img_embed.t()
+#     return logits_per_image, logits_per_text
 
 # def multiGPU_CLIP(model_image, model_text, model, images, text_tokens, prompt_token=None):
 #     image_embedding = model_image(images, prompt_token)
@@ -561,24 +570,6 @@ def multiGPU_CLIP(model_image, model_text, model, images, text_tokens, prompt_to
 #
 #
 #     logit_scale = model.logit_scale.exp()
-#     output, _ = create_logits(image_embedding, text_embedding, logit_scale)
-#     return output, _
-
-
-# def multiGPU_CLIP(model_image, model_text, model, images, text_tokens, prompt_token=None):
-#     # image_embedding = model_image(images, prompt_token)
-#     # text_embedding = model_text(text_tokens)
-#     #
-#     # print('image_embedding',images.size(), image_embedding.size())
-#
-#     # logit_scale = model.logit_scale.exp()
-#
-#     img_embed, scale_text_embed = model(images, text_tokens, prompt_token)  # [local batch, C]
-#     print(img_embed)
-#
-#     exit()
-#     all_img = all_gather(img_embed)
-#
 #     output, _ = create_logits(image_embedding, text_embedding, logit_scale)
 #     return output, _
 
@@ -645,7 +636,7 @@ def train(train_loader, texts, model, model_text, model_image, prompter, add_pro
         scaler.update()
 
         # Note: we clamp to 4.6052 = ln(100), as in the original paper.
-        model.module.logit_scale.data = torch.clamp(model.module.logit_scale.data, 0, 4.6052)
+        model.logit_scale.data = torch.clamp(model.logit_scale.data, 0, 4.6052)
 
         # measure accuracy
         acc1 = accuracy(output, target, topk=(1,))
@@ -797,7 +788,6 @@ def validate(val_loader_list, val_dataset_name, texts_list, model, model_text, m
                     break
 
 
-
         torch.cuda.empty_cache()
 
         print(dataset_name + ' * Adv Prompt Acc@1 {top1_adv_prompt.avg:.3f} Adv Original Acc@1 {top1_adv_org.avg:.3f} '
@@ -814,7 +804,6 @@ def validate(val_loader_list, val_dataset_name, texts_list, model, model_text, m
     #     })
 
     return np.mean(acc_all)
-
 
 if __name__ == '__main__':
     main()
