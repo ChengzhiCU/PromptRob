@@ -11,8 +11,8 @@ import torch
 import torch.backends.cudnn as cudnn
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
-# from torchvision.datasets import CIFAR100, CIFAR10, Caltech101, STL10, StanfordCars, Food101, SUN397
-from torchvision.datasets import CIFAR100, CIFAR10
+from torchvision.datasets import CIFAR100, CIFAR10, Caltech101, STL10, StanfordCars, Food101, SUN397
+from torchvision.datasets import CIFAR100, CIFAR10, OxfordIIITPet, Flowers102, Country211, Caltech256
 
 import torchvision.transforms as transforms
 import torchvision
@@ -34,11 +34,11 @@ def parse_option():
                         help='print frequency')
     parser.add_argument('--save_freq', type=int, default=50,
                         help='save frequency')
-    parser.add_argument('--validate_freq', type=int, default=10,
+    parser.add_argument('--validate_freq', type=int, default=1,
                         help='validate frequency')
     parser.add_argument('--batch_size', type=int, default=16,
                         help='batch_size')
-    parser.add_argument('--num_workers', type=int, default=16,
+    parser.add_argument('--num_workers', type=int, default=32,
                         help='num of workers to use')
     parser.add_argument('--epochs', type=int, default=1000,
                         help='number of training epoch5s')
@@ -54,6 +54,14 @@ def parse_option():
                         help="number of steps to warmup for")
     parser.add_argument('--momentum', type=float, default=0.9,
                         help='momentum')
+    parser.add_argument('--train_eps', type=float, default=2,
+                        help='momentum')
+    parser.add_argument('--train_numsteps', type=int, default=5)
+    parser.add_argument('--train_stepsize', type=int, default=1)
+    parser.add_argument('--test_eps', type=float, default=2,
+                        help='momentum')
+    parser.add_argument('--test_numsteps', type=int, default=5)
+    parser.add_argument('--test_stepsize', type=int, default=1)
     parser.add_argument('--patience', type=int, default=1000)
 
     # model
@@ -155,8 +163,8 @@ class ImageCLIP(nn.Module):
         return self.model.encode_image(image, prompt_token)
 
 
-alpha_test = 1. / 255
-attack_iters_test = 5
+# alpha_test = 1. / 255
+# attack_iters_test = 5
 
 epsilon = 2./255
 upper_limit, lower_limit = 1,0
@@ -287,8 +295,11 @@ def main():
     # val_dataset_name = ['cifar10', 'cifar100', 'STL10', 'StanfordCars', 'Food101', 'SUN397']
     val_dataset_name = ['cifar10', 'cifar100', 'STL-10', 'SUN397']
     val_dataset_name = ['SUN397', 'StanfordCars', 'Food101']
-    val_dataset_name = ['ImageNet', 'cifar10', 'cifar100',  'STL10', 'StanfordCars','SUN397']
-    val_dataset_name = ['zeroshot_cifar100', 'cifar10']
+    val_dataset_name = ['ImageNet', 'cifar10', 'cifar100',  'STL10', 'StanfordCars','SUN397','Food101', 'oxfordpet', 'FER2013', 'flowers102', 'Country211', 'Caltech256']
+    val_dataset_name = ['ImageNet', 'cifar10', 'cifar100',  'STL10', 'StanfordCars','SUN397','Food101', 'oxfordpet']
+    # val_dataset_name = ['zeroshot_cifar100', 'cifar10']
+
+    val_dataset_name = ['cifar10', 'cifar100', 'StanfordCars','SUN397','Food101', 'oxfordpet']
 
     for each in val_dataset_name:
         if each == 'cifar10':
@@ -301,8 +312,8 @@ def main():
             assert args.dataset == 'zeroshot_cifar100'
             val_dataset_list.append(CLASS_SPLIT_CIFAR100(args.root, transform=preprocess,
                                download=True, train=False, train_class_count=train_class_count))
-        elif each == 'Caltech101':
-            val_dataset_list.append(Caltech101(args.root, target_type='category', transform=preprocess224,
+        elif each == 'Caltech256':
+            val_dataset_list.append(Caltech256(args.root, transform=preprocess224,
                                              download=True))
         elif each == 'STL10':
             val_dataset_list.append(STL10(args.root, split='test',
@@ -316,6 +327,18 @@ def main():
         elif each == 'Food101':
             val_dataset_list.append(Food101(args.root, split='test',
                                            transform=preprocess224, download=True))
+        elif each == 'oxfordpet':
+            val_dataset_list.append(OxfordIIITPet(args.root, split='test',
+                                           transform=preprocess224, download=True))
+        # elif each == 'FER2013':
+        #     val_dataset_list.append(OxfordIIITPet(args.root, split='test',
+        #                                    transform=preprocess224, download=True))
+        # elif each == 'flowers102':
+        #     val_dataset_list.append(Flowers102(args.root, split='test',
+        #                                    transform=preprocess224, download=True))
+        # elif each == 'Country211':
+        #     val_dataset_list.append(Country211(args.root, split='test',
+        #                                    transform=preprocess224, download=True))
         elif each == 'ImageNet':
             val_dataset_list.append(torchvision.datasets.ImageFolder(
             os.path.join(imagenet_root, 'val'),
@@ -424,6 +447,7 @@ def main():
         save_checkpoint({
             'epoch': epoch + 1,
             'state_dict': prompter.state_dict(),
+            'add_prompter': add_prompter.state_dict(),
             'best_acc1': best_acc1,
             'optimizer': optimizer.state_dict(),
         }, args, is_best=is_best)
@@ -443,7 +467,7 @@ def main():
 def clamp(X, lower_limit, upper_limit):
     return torch.max(torch.min(X, upper_limit), lower_limit)
 
-def attack_pgd(prompter, model, model_text, model_image, add_prompter, criterion, X, target, text_tokens, alpha, attack_iters, norm, restarts=1, early_stop=True):
+def attack_pgd(prompter, model, model_text, model_image, add_prompter, criterion, X, target, text_tokens, alpha, attack_iters, norm, restarts=1, early_stop=True, epsilon=0):
 
     delta = torch.zeros_like(X).cuda()
     if norm == "l_inf":
@@ -495,7 +519,7 @@ def attack_pgd(prompter, model, model_text, model_image, add_prompter, criterion
     return delta
 
 
-def attack_pgd_noprompt(prompter, model, model_text, model_image, criterion, X, target, text_tokens, alpha, attack_iters, norm, restarts=1, early_stop=True):
+def attack_pgd_noprompt(prompter, model, model_text, model_image, criterion, X, target, text_tokens, alpha, attack_iters, norm, restarts=1, early_stop=True, epsilon=0):
 
     delta = torch.zeros_like(X).cuda()
     if norm == "l_inf":
@@ -619,7 +643,7 @@ def train(train_loader, texts, model, model_text, model_image, prompter, add_pro
         with autocast():
 
             delta = attack_pgd(prompter, model, model_text, model_image, add_prompter, criterion, images,
-                               target, text_tokens, alpha, attack_iters, 'l_inf')
+                               target, text_tokens, alpha, attack_iters, 'l_inf', epsilon=args.train_eps)
             # print('delta', delta.min(), delta.max())
 
             tmp = clip_img_preprocessing(images + delta)
@@ -744,7 +768,7 @@ def validate(val_loader_list, val_dataset_name, texts_list, model, model_text, m
 
                 # generate adv example
                 delta_prompt = attack_pgd(prompter, model, model_text, model_image, add_prompter, criterion, images, target, text_tokens,
-                                        alpha_test, attack_iters_test, 'l_inf')
+                                        args.test_stepsize, args.test_numsteps, 'l_inf', epsilon=args.test_eps)
 
 
                 # compute output
@@ -760,8 +784,8 @@ def validate(val_loader_list, val_dataset_name, texts_list, model, model_text, m
                 # bl attack
                 torch.cuda.empty_cache()
 
-                delta_noprompt = attack_pgd_noprompt(prompter, model, model_text, model_image, criterion, images, target, text_tokens, alpha_test, attack_iters_test,
-                                        'l_inf')
+                delta_noprompt = attack_pgd_noprompt(prompter, model, model_text, model_image, criterion, images, target, text_tokens, args.test_stepsize, args.test_numsteps,
+                                        'l_inf', epsilon=args.test_eps)
                 torch.cuda.empty_cache()
                 with torch.no_grad():
                     # output_org_adv, _ = model(clip_img_preprocessing(images+delta_noprompt), text_tokens)
