@@ -12,7 +12,7 @@ import torch.backends.cudnn as cudnn
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from torchvision.datasets import CIFAR100, CIFAR10, Caltech101, STL10, StanfordCars, Food101, SUN397
-from torchvision.datasets import CIFAR100, CIFAR10, OxfordIIITPet, Flowers102, Country211, Caltech256
+from torchvision.datasets import OxfordIIITPet, Flowers102, Country211, Caltech256
 
 import torchvision.transforms as transforms
 import torchvision
@@ -102,7 +102,10 @@ def parse_option():
                         help='evaluate model test set')
     parser.add_argument('--gpu', type=int, default=None,
                         help='gpu to use')
-    parser.add_argument('--debug', action='store_true')
+    parser.add_argument('--tag', type=str, default=''),
+    parser.add_argument('--debug', action='store_true'),
+    parser.add_argument('--train_class_count', type=int, default=90),
+
     # parser.add_argument('--use_wandb', default=False,
     #                     action="store_true",
     #                     help='whether to use wandb')
@@ -112,6 +115,11 @@ def parse_option():
     args.filename = '{}_{}_{}_{}_{}_{}_{}_lr_{}_decay_{}_bsz_{}_warmup_{}_trial_{}_addp_{}'. \
         format(args.name, args.method, args.prompt_size, args.dataset, args.model, args.arch,
                args.optim, args.learning_rate, args.weight_decay, args.batch_size, args.warmup, args.trial, args.add_prompt_size)
+
+    args.filename = '{}_{}_{}_{}_{}_{}_lr_{}_decay_{}_bsz_{}_warmup_{}_trial_{}_addp_{}_traincls_{}{}'. \
+        format(args.method, args.prompt_size, args.dataset, args.model, args.arch,
+               args.optim, args.learning_rate, args.weight_decay, args.batch_size, args.warmup, args.trial, args.add_prompt_size, 
+               args.train_class_count, args.tag,)
 
     return args
 
@@ -276,12 +284,12 @@ def main():
         )
 
     elif args.dataset == 'zeroshot_cifar100':
-        train_class_count = 50
-        train_dataset = CLASS_SPLIT_CIFAR100(args.root, transform=preprocess,
-                                 download=True, train=True, train_class_count=train_class_count)
+        train_class_count = args.train_class_count
+        train_dataset = CLASS_SPLIT_CIFAR100(args.root, transform=preprocess, download=True, 
+                            train=True, train_class_count=train_class_count, load_train_classes=True)
  
-        val_dataset = CLASS_SPLIT_CIFAR100(args.root, transform=preprocess,
-                               download=True, train=False, train_class_count=train_class_count)
+        val_dataset = CLASS_SPLIT_CIFAR100(args.root, transform=preprocess, download=True, 
+                            train=True, train_class_count=train_class_count, load_train_classes=False)
 
         # train_dataset = torchvision.datasets.ImageFolder(
         #     root=imagenet_root,
@@ -296,12 +304,9 @@ def main():
     # val_dataset_name=['cifar10', 'cifar100', 'LSUN', 'STL-10', 'StanfordCars', 'Food101', 'SUN397', ]
     # val_dataset_name = ['cifar10', 'cifar100', 'STL10', 'StanfordCars', 'Food101', 'SUN397']
     val_dataset_name = ['cifar10', 'cifar100', 'STL-10', 'SUN397']
-    val_dataset_name = ['SUN397', 'StanfordCars', 'Food101']
     val_dataset_name = ['ImageNet', 'cifar10', 'cifar100',  'STL10', 'StanfordCars','SUN397','Food101', 'oxfordpet', 'FER2013', 'flowers102', 'Country211', 'Caltech256']
     val_dataset_name = ['ImageNet', 'cifar10', 'cifar100',  'STL10', 'StanfordCars','SUN397','Food101', 'oxfordpet']
-    # val_dataset_name = ['zeroshot_cifar100', 'cifar10']
-
-    # val_dataset_name = ['cifar10', 'cifar100', 'StanfordCars','SUN397','Food101', 'oxfordpet']
+    val_dataset_name = ['zeroshot_cifar100', 'zeroshot_cifar100_overlap', 'cifar10']
 
     for each in val_dataset_name:
         if each == 'cifar10':
@@ -312,8 +317,12 @@ def main():
                                             download=True, train=False))
         elif each == 'zeroshot_cifar100':
             assert args.dataset == 'zeroshot_cifar100'
-            val_dataset_list.append(CLASS_SPLIT_CIFAR100(args.root, transform=preprocess,
-                               download=True, train=False, train_class_count=train_class_count))
+            val_dataset_list.append(CLASS_SPLIT_CIFAR100(args.root, transform=preprocess, download=True,
+                               train=False, train_class_count=train_class_count, load_train_classes=False))
+        elif each == 'zeroshot_cifar100_overlap':
+            assert args.dataset == 'zeroshot_cifar100'
+            val_dataset_list.append(CLASS_SPLIT_CIFAR100(args.root, transform=preprocess, download=True,
+                               train=False, train_class_count=train_class_count, load_train_classes=True))
         elif each == 'Caltech256':
             val_dataset_list.append(Caltech256(args.root, transform=preprocess224,
                                              download=True))
@@ -376,7 +385,6 @@ def main():
         new_class_names = []
         for each in class_names:
             new_class_names.append(folder2name[each])
-        
         class_names = new_class_names
 
     class_names = refine_classname(class_names)
@@ -384,19 +392,22 @@ def main():
 
     texts_list = []
     for cnt, each in enumerate(val_dataset_list):
-        class_names = each.classes
-        if val_dataset_name[cnt] == 'ImageNet':
-            from utils import load_imagenet_folder2name
-            folder2name = load_imagenet_folder2name('imagenet_classes_names.txt')
-            new_class_names = []
-            for each in class_names:
-                new_class_names.append(folder2name[each])
-            class_names = new_class_names
+        if hasattr(each, 'clip_prompts'):
+            texts_tmp = each.clip_prompts
+        else:
+            class_names = each.classes
+            if val_dataset_name[cnt] == 'ImageNet':
+                from utils import load_imagenet_folder2name
+                folder2name = load_imagenet_folder2name('imagenet_classes_names.txt')
+                new_class_names = []
+                for each in class_names:
+                    new_class_names.append(folder2name[each])
+                class_names = new_class_names
 
-        class_names = refine_classname(class_names)
-        texts_tmp = [template.format(label) for label in class_names]
+            class_names = refine_classname(class_names)
+            texts_tmp = [template.format(label) for label in class_names]
         texts_list.append(texts_tmp)
-
+    assert len(texts_list) = len(val_dataset_list)
 
     # define criterion and optimizer
     optimizer = torch.optim.SGD(list(prompter.parameters())+list(add_prompter.parameters()),
@@ -581,26 +592,9 @@ def multiGPU_CLIP(model_image, model_text, model, images, text_tokens, prompt_to
 
 # def multiGPU_CLIP(model_image, model_text, model, images, text_tokens, prompt_token=None):
 #     img_embed, scale_text_embed = model(images, text_tokens, prompt_token)
-#     # print('test len', len(scale_text_embed), scale_text_embed.size())
-#     # print('img', img_embed.size())
-#     # exit()
-
-#     # output, _ = create_logits(image_embedding, text_embedding, logit_scale)
 #     logits_per_image = img_embed @ scale_text_embed.t()
 #     logits_per_text = scale_text_embed @ img_embed.t()
 #     return logits_per_image, logits_per_text
-
-# def multiGPU_CLIP(model_image, model_text, model, images, text_tokens, prompt_token=None):
-#     image_embedding = model_image(images, prompt_token)
-#     text_embedding = model_text(text_tokens)
-#
-#     print('image_embedding',images.size(),  len(image_embedding))
-#
-#
-#     logit_scale = model.logit_scale.exp()
-#     output, _ = create_logits(image_embedding, text_embedding, logit_scale)
-#     return output, _
-
 
 def train(train_loader, texts, model, model_text, model_image, prompter, add_prompter, optimizer, scheduler, criterion, scaler, epoch, args):
     batch_time = AverageMeter('Time', ':6.3f')

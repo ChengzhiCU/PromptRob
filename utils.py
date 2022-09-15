@@ -16,7 +16,7 @@ def convert_models_to_fp32(model):
 
 def refine_classname(class_names):
     for i, class_name in enumerate(class_names):
-        class_names[i] = class_name.lower().replace('_', ' ').replace('-', ' ')
+        class_names[i] = class_name.lower().replace('_', ' ').replace('-', ' ').replace('/', ' ')
     return class_names
 
 
@@ -148,6 +148,8 @@ class CLASS_SPLIT_CIFAR100(CIFAR10):
         target_transform: Optional[Callable] = None,
         download: bool = False,
         train_class_count = 50,
+        load_train_classes = True,
+        mix_all_data = False,
         random_seed = 0, # TODO: random class splitting?
     ) -> None:
 
@@ -160,7 +162,11 @@ class CLASS_SPLIT_CIFAR100(CIFAR10):
         if not self._check_integrity():
             raise RuntimeError("Dataset not found or corrupted. You can use download=True to download it")
 
-        downloaded_list = self.train_list + self.test_list
+        if mix_all_data:
+            downloaded_list = self.train_list + self.test_list
+        else:
+            downloaded_list = self.train_list if train else self.test_list
+
         self.data: Any = []
         self.targets = []
         self._load_meta()
@@ -168,7 +174,7 @@ class CLASS_SPLIT_CIFAR100(CIFAR10):
         class_idx = list(range(len(self.classes)))
         train_classes = set(class_idx[:train_class_count])
         test_classes = set(class_idx[train_class_count:])
-        if self.train:
+        if load_train_classes:
             desired_classes = train_classes
         else:
             desired_classes = test_classes
