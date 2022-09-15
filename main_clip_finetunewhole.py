@@ -19,13 +19,14 @@ import torchvision
 
 import clip
 from models import prompters
-from models.prompters import TokenPrompter
+from models.prompters import TokenPrompter, NullPrompter
 from utils import CLASS_SPLIT_CIFAR100, accuracy, AverageMeter, ProgressMeter, save_checkpoint
 from utils import cosine_lr, convert_models_to_fp32, refine_classname
 
 import torch.nn.functional as F
 import numpy as np
 import torch.nn as nn
+
 
 def parse_option():
     parser = argparse.ArgumentParser('Visual Prompting for CLIP')
@@ -46,7 +47,7 @@ def parse_option():
     # optimization
     parser.add_argument('--optim', type=str, default='sgd',
                         help='optimizer to use')
-    parser.add_argument('--learning_rate', type=float, default=40,  ## Why so large
+    parser.add_argument('--learning_rate', type=float, default=0.1,  ## Why so large
                         help='learning rate')
     parser.add_argument("--weight_decay", type=float, default=0,
                         help="weight decay")
@@ -67,10 +68,10 @@ def parse_option():
     # model
     parser.add_argument('--model', type=str, default='clip')
     parser.add_argument('--arch', type=str, default='vit_b32')
-    parser.add_argument('--name', type=str, default='')
     parser.add_argument('--method', type=str, default='padding',
                         choices=['padding', 'random_patch', 'fixed_patch'],
                         help='choose visual prompting method')
+    parser.add_argument('--name', type=str, default='')
     parser.add_argument('--prompt_size', type=int, default=30,
                         help='size for visual prompts')
     parser.add_argument('--add_prompt_size', type=int, default=10,
@@ -111,9 +112,11 @@ def parse_option():
 
     args.filename = '{}_{}_{}_{}_{}_{}_{}_lr_{}_decay_{}_bsz_{}_warmup_{}_trial_{}_addp_{}'. \
         format(args.name, args.method, args.prompt_size, args.dataset, args.model, args.arch,
-               args.optim, args.learning_rate, args.weight_decay, args.batch_size, args.warmup, args.trial, args.add_prompt_size)
+               args.optim, args.learning_rate, args.weight_decay, args.batch_size, args.warmup, args.trial,
+               args.add_prompt_size)
 
     return args
+
 
 best_acc1 = 0
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -128,12 +131,14 @@ std = torch.tensor(CIFAR100_STD).view(3, 1, 1).cuda()
 def normalize(X):
     return (X - mu) / std
 
+
 def clip_img_preprocessing(X):
-    img_size=224
+    img_size = 224
     X = torch.nn.functional.upsample(X, size=(img_size, img_size), mode='bicubic')
     X = normalize(X)
 
     return X
+
 
 # for multiGPU clip
 def create_logits(x1, x2, logit_scale):
@@ -147,6 +152,7 @@ def create_logits(x1, x2, logit_scale):
     # shape = [global_batch_size, global_batch_size]
     return logits_per_x1, logits_per_x2
 
+
 class TextCLIP(nn.Module):
     def __init__(self, model):
         super(TextCLIP, self).__init__()
@@ -154,6 +160,7 @@ class TextCLIP(nn.Module):
 
     def forward(self, text):
         return self.model.encode_text(text)
+
 
 class ImageCLIP(nn.Module):
     def __init__(self, model):
@@ -167,38 +174,35 @@ class ImageCLIP(nn.Module):
 # alpha_test = 1. / 255
 # attack_iters_test = 5
 
-epsilon = 2./255
-upper_limit, lower_limit = 1,0
+epsilon = 2. / 255
+upper_limit, lower_limit = 1, 0
 
 
 def main():
     global best_acc1, device
 
     args = parse_option()
-    print (args)
+    print(args)
 
     if args.seed is not None:
         random.seed(args.seed)
         torch.manual_seed(args.seed)
         cudnn.deterministic = True
-    import socket
-    if socket.gethostname() == 'cv12':
-        imagenet_root = '/local/vondrick/chengzhi/ImageNet-clean'
-    else:
-        imagenet_root = '/local/vondrick/datasets/ImageNet-clean'
+
+    imagenet_root = '/local/vondrick/datasets/ImageNet-clean'
 
     # create model
-    add_prompt_len=args.add_prompt_size
+    add_prompt_len = args.add_prompt_size
 
     model, preprocess = clip.load('ViT-B/32', device, jit=False, prompt_len=add_prompt_len)
     convert_models_to_fp32(model)
 
     model_text = TextCLIP(model)
     model_image = ImageCLIP(model)
-    
+
     model_text = torch.nn.DataParallel(model_text)
     model_image = torch.nn.DataParallel(model_image)
-    
+
     convert_models_to_fp32(model_text)
     convert_models_to_fp32(model_image)
     # model_text, model_image = None, None
@@ -207,14 +211,16 @@ def main():
 
     # model = torch.nn.DataParallel(model) #.to(device)
     model.eval()
-    model_text.eval()
+    model_text.train()
     model_image.eval()
 
-    prompter = prompters.__dict__[args.method](args)  # .to(device)
-    add_prompter = TokenPrompter(add_prompt_len)  # .to(device)
+    # prompter = prompters.__dict__[args.method](args)  # .to(device)
+    # add_prompter = TokenPrompter(add_prompt_len)  # .to(device)
+    #
+    # prompter = torch.nn.DataParallel(prompter).cuda()
+    # add_prompter = torch.nn.DataParallel(add_prompter).cuda()
 
-    prompter = torch.nn.DataParallel(prompter).cuda()
-    add_prompter = torch.nn.DataParallel(add_prompter).cuda()
+
 
     # optionally resume from a checkpoint
     if args.resume:
@@ -231,8 +237,7 @@ def main():
             if args.gpu is not None:
                 # best_acc1 may be from a checkpoint from a different GPU
                 best_acc1 = best_acc1.to(args.gpu)
-            prompter.load_state_dict(checkpoint['state_dict'])
-            add_prompter.load_state_dict(checkpoint['add_prompter'])
+            # prompter.load_state_dict(checkpoint['state_dict'])
             print("=> loaded checkpoint '{}' (epoch {})"
                   .format(args.resume, checkpoint['epoch']))
         else:
@@ -241,6 +246,9 @@ def main():
     # create data
     template = 'This is a photo of a {}'
     print(f'template: {template}')
+
+    # print(preprocess, 'preprocess')
+    # exit()
 
     # TODO: we can train on cifar10 and test on cifar10, 100 in zero shot way, to see if generalize.
     preprocess = transforms.Compose([
@@ -264,10 +272,10 @@ def main():
                                download=True, train=False)
     elif args.dataset == 'cifar10':
         train_dataset = CIFAR10(args.root, transform=preprocess,
-                                 download=True, train=True)
+                                download=True, train=True)
 
         val_dataset = CIFAR10(args.root, transform=preprocess,
-                               download=True, train=False)
+                              download=True, train=False)
 
     elif args.dataset == 'ImageNet':
         train_dataset = torchvision.datasets.ImageFolder(
@@ -278,10 +286,10 @@ def main():
     elif args.dataset == 'zeroshot_cifar100':
         train_class_count = 50
         train_dataset = CLASS_SPLIT_CIFAR100(args.root, transform=preprocess,
-                                 download=True, train=True, train_class_count=train_class_count)
- 
+                                             download=True, train=True, train_class_count=train_class_count)
+
         val_dataset = CLASS_SPLIT_CIFAR100(args.root, transform=preprocess,
-                               download=True, train=False, train_class_count=train_class_count)
+                                           download=True, train=False, train_class_count=train_class_count)
 
         # train_dataset = torchvision.datasets.ImageFolder(
         #     root=imagenet_root,
@@ -292,46 +300,49 @@ def main():
         #         transforms.ToTensor(),
         #     ]))
 
-    val_dataset_list=[]
+    val_dataset_list = []
     # val_dataset_name=['cifar10', 'cifar100', 'LSUN', 'STL-10', 'StanfordCars', 'Food101', 'SUN397', ]
     # val_dataset_name = ['cifar10', 'cifar100', 'STL10', 'StanfordCars', 'Food101', 'SUN397']
     val_dataset_name = ['cifar10', 'cifar100', 'STL-10', 'SUN397']
     val_dataset_name = ['SUN397', 'StanfordCars', 'Food101']
-    val_dataset_name = ['ImageNet', 'cifar10', 'cifar100',  'STL10', 'StanfordCars','SUN397','Food101', 'oxfordpet', 'FER2013', 'flowers102', 'Country211', 'Caltech256']
-    val_dataset_name = ['ImageNet', 'cifar10', 'cifar100',  'STL10', 'StanfordCars','SUN397','Food101', 'oxfordpet']
+    val_dataset_name = ['ImageNet', 'cifar10', 'cifar100', 'STL10', 'StanfordCars', 'SUN397', 'Food101', 'oxfordpet',
+                        'FER2013', 'flowers102', 'Country211', 'Caltech256']
+    val_dataset_name = ['ImageNet', 'cifar10', 'cifar100', 'STL10', 'StanfordCars', 'SUN397', 'Food101', 'oxfordpet']
     # val_dataset_name = ['zeroshot_cifar100', 'cifar10']
 
-    # val_dataset_name = ['cifar10', 'cifar100', 'StanfordCars','SUN397','Food101', 'oxfordpet']
+    val_dataset_name = ['cifar10', 'cifar100', 'StanfordCars', 'SUN397', 'Food101', 'oxfordpet']
+    val_dataset_name = ['cifar10', 'cifar100']
 
     for each in val_dataset_name:
         if each == 'cifar10':
             val_dataset_list.append(CIFAR10(args.root, transform=preprocess,
-                               download=True, train=False))
+                                            download=True, train=False))
         elif each == 'cifar100':
             val_dataset_list.append(CIFAR100(args.root, transform=preprocess,
-                                            download=True, train=False))
+                                             download=True, train=False))
         elif each == 'zeroshot_cifar100':
             assert args.dataset == 'zeroshot_cifar100'
             val_dataset_list.append(CLASS_SPLIT_CIFAR100(args.root, transform=preprocess,
-                               download=True, train=False, train_class_count=train_class_count))
+                                                         download=True, train=False,
+                                                         train_class_count=train_class_count))
         elif each == 'Caltech256':
             val_dataset_list.append(Caltech256(args.root, transform=preprocess224,
-                                             download=True))
+                                               download=True))
         elif each == 'STL10':
             val_dataset_list.append(STL10(args.root, split='test',
-                                               transform=preprocess, download=True))
+                                          transform=preprocess, download=True))
         elif each == 'SUN397':
             val_dataset_list.append(SUN397(args.root,
-                                               transform=preprocess224, download=True))
+                                           transform=preprocess224, download=True))
         elif each == 'StanfordCars':
             val_dataset_list.append(StanfordCars(args.root, split='test',
-                                           transform=preprocess224, download=True))
+                                                 transform=preprocess224, download=True))
         elif each == 'Food101':
             val_dataset_list.append(Food101(args.root, split='test',
-                                           transform=preprocess224, download=True))
+                                            transform=preprocess224, download=True))
         elif each == 'oxfordpet':
             val_dataset_list.append(OxfordIIITPet(args.root, split='test',
-                                           transform=preprocess224, download=True))
+                                                  transform=preprocess224, download=True))
         # elif each == 'FER2013':
         #     val_dataset_list.append(OxfordIIITPet(args.root, split='test',
         #                                    transform=preprocess224, download=True))
@@ -343,9 +354,9 @@ def main():
         #                                    transform=preprocess224, download=True))
         elif each == 'ImageNet':
             val_dataset_list.append(torchvision.datasets.ImageFolder(
-            os.path.join(imagenet_root, 'val'),
-            transform=preprocess224))
-            
+                os.path.join(imagenet_root, 'val'),
+                transform=preprocess224))
+
             # val_dataset_list.append(torchvision.datasets.ImageNet(
             # root=imagenet_root,
             # split='val',
@@ -358,15 +369,14 @@ def main():
     train_sampler = None
     val_sampler = None
 
-
-
     train_loader = DataLoader(train_dataset,
                               batch_size=args.batch_size, pin_memory=True,
                               num_workers=args.num_workers, shuffle=True, sampler=train_sampler)
 
     val_loader_list = [DataLoader(each,
-                            batch_size=args.batch_size, pin_memory=True,
-                            num_workers=args.num_workers, shuffle=False, sampler=val_sampler) for each in val_dataset_list]
+                                  batch_size=args.batch_size, pin_memory=True,
+                                  num_workers=args.num_workers, shuffle=False, sampler=val_sampler) for each in
+                       val_dataset_list]
 
     class_names = train_dataset.classes
 
@@ -376,11 +386,17 @@ def main():
         new_class_names = []
         for each in class_names:
             new_class_names.append(folder2name[each])
-        
+
         class_names = new_class_names
 
     class_names = refine_classname(class_names)
     texts_train = [template.format(label) for label in class_names]
+
+    prompter = NullPrompter()
+    add_prompter = TokenPrompter(add_prompt_len)  # .to(device)
+
+    prompter = torch.nn.DataParallel(prompter).cuda()
+    add_prompter = torch.nn.DataParallel(add_prompter).cuda()
 
     texts_list = []
     for cnt, each in enumerate(val_dataset_list):
@@ -397,9 +413,8 @@ def main():
         texts_tmp = [template.format(label) for label in class_names]
         texts_list.append(texts_tmp)
 
-
     # define criterion and optimizer
-    optimizer = torch.optim.SGD(list(prompter.parameters())+list(add_prompter.parameters()),
+    optimizer = torch.optim.SGD(model_image.parameters(),
                                 lr=args.learning_rate,
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay)
@@ -427,8 +442,8 @@ def main():
     #     wandb.watch(prompter, criterion, log='all', log_freq=10)
 
     if args.evaluate:
-        acc1_mean = validate(val_loader_list, val_dataset_name, texts_list, model, model_text, model_image,
-                                prompter, add_prompter, criterion, args)
+        acc1_mean = validate(val_loader_list, val_dataset_name, texts_list, model, prompter, add_prompter, criterion,
+                             args)
         return
 
     epochs_since_improvement = 0
@@ -442,7 +457,7 @@ def main():
         # evaluate on validation set
         if epoch % args.validate_freq == 0:
             acc1_mean = validate(val_loader_list, val_dataset_name, texts_list, model, model_text, model_image,
-                                prompter, add_prompter, criterion, args)
+                                 prompter, add_prompter, criterion, args)
 
         # remember best acc@1 and save checkpoint
         is_best = acc1_mean > best_acc1
@@ -452,6 +467,7 @@ def main():
             'epoch': epoch + 1,
             'state_dict': prompter.state_dict(),
             'add_prompter': add_prompter.state_dict(),
+            'clip': model.state_dict(),
             'best_acc1': best_acc1,
             'optimizer': optimizer.state_dict(),
         }, args, is_best=is_best)
@@ -468,11 +484,13 @@ def main():
 
     # wandb.run.finish()
 
+
 def clamp(X, lower_limit, upper_limit):
     return torch.max(torch.min(X, upper_limit), lower_limit)
 
-def attack_pgd(prompter, model, model_text, model_image, add_prompter, criterion, X, target, text_tokens, alpha, attack_iters, norm, restarts=1, early_stop=True, epsilon=0):
 
+def attack_pgd(prompter, model, model_text, model_image, add_prompter, criterion, X, target, text_tokens, alpha,
+               attack_iters, norm, restarts=1, early_stop=True, epsilon=0):
     delta = torch.zeros_like(X).cuda()
     if norm == "l_inf":
         delta.uniform_(-epsilon, epsilon)
@@ -523,8 +541,8 @@ def attack_pgd(prompter, model, model_text, model_image, add_prompter, criterion
     return delta
 
 
-def attack_pgd_noprompt(prompter, model, model_text, model_image, criterion, X, target, text_tokens, alpha, attack_iters, norm, restarts=1, early_stop=True, epsilon=0):
-
+def attack_pgd_noprompt(prompter, model, model_text, model_image, criterion, X, target, text_tokens, alpha,
+                        attack_iters, norm, restarts=1, early_stop=True, epsilon=0):
     delta = torch.zeros_like(X).cuda()
     if norm == "l_inf":
         delta.uniform_(-epsilon, epsilon)
@@ -548,7 +566,6 @@ def attack_pgd_noprompt(prompter, model, model_text, model_image, criterion, X, 
 
         loss = criterion(output, target)
 
-
         loss.backward()
         grad = delta.grad.detach()
         d = delta[:, :, :, :]
@@ -566,9 +583,10 @@ def attack_pgd_noprompt(prompter, model, model_text, model_image, criterion, X, 
 
     return delta
 
+
 def multiGPU_CLIP(model_image, model_text, model, images, text_tokens, prompt_token=None):
     image_features = model_image(images, prompt_token=prompt_token)
-    text_features = model_text(text_tokens)
+    text_features = model_text(text_tokens).detach()   # When we finetuning CLIP, we do not change the text encoder.
 
     image_features = image_features / image_features.norm(dim=1, keepdim=True)
     text_features = text_features / text_features.norm(dim=1, keepdim=True)
@@ -578,6 +596,7 @@ def multiGPU_CLIP(model_image, model_text, model, images, text_tokens, prompt_to
     logits_per_image = image_features @ scaled_text_features.t()
     logits_per_text = scaled_text_features @ image_features.t()
     return logits_per_image, logits_per_text
+
 
 # def multiGPU_CLIP(model_image, model_text, model, images, text_tokens, prompt_token=None):
 #     img_embed, scale_text_embed = model(images, text_tokens, prompt_token)
@@ -602,7 +621,8 @@ def multiGPU_CLIP(model_image, model_text, model, images, text_tokens, prompt_to
 #     return output, _
 
 
-def train(train_loader, texts, model, model_text, model_image, prompter, add_prompter, optimizer, scheduler, criterion, scaler, epoch, args):
+def train(train_loader, texts, model, model_text, model_image, prompter, add_prompter, optimizer, scheduler, criterion,
+          scaler, epoch, args):
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
@@ -617,8 +637,8 @@ def train(train_loader, texts, model, model_text, model_image, prompter, add_pro
 
     num_batches_per_epoch = len(train_loader)
 
-    alpha = 1/255
-    attack_iters=5
+    alpha = 1 / 255
+    attack_iters = 5
 
     print('text token', texts)
 
@@ -701,7 +721,6 @@ def train(train_loader, texts, model, model_text, model_image, prompter, add_pro
 # def validate(val_loader, texts, model, prompter, add_prompter, criterion, args):
 def validate(val_loader_list, val_dataset_name, texts_list, model, model_text, model_image,
              prompter, add_prompter, criterion, args):
-
     dataset_num = len(val_loader_list)
     acc_all = []
 
@@ -710,7 +729,6 @@ def validate(val_loader_list, val_dataset_name, texts_list, model, model_text, m
         val_loader = val_loader_list[cnt]
         texts = texts_list[cnt]
         dataset_name = val_dataset_name[cnt]
-
 
         batch_time = AverageMeter('Time', ':6.3f')
         losses = AverageMeter('Loss', ':.4e')
@@ -735,7 +753,7 @@ def validate(val_loader_list, val_dataset_name, texts_list, model, model_text, m
         for i, (images, target) in enumerate(tqdm(val_loader)):
 
             if 'cifar' not in val_dataset_name:
-                if i%20 != 0:
+                if i % 20 != 0:
                     continue
 
             images = images.to(device)
@@ -752,11 +770,12 @@ def validate(val_loader_list, val_dataset_name, texts_list, model, model_text, m
                     prompt_token = add_prompter()
                     # output_prompt, _ = model(prompter(clip_img_preprocessing(images)), text_tokens, prompt_token)
                     output_prompt, _ = multiGPU_CLIP(model_image, model_text, model,
-                                                    prompter(clip_img_preprocessing(images)), text_tokens, prompt_token)
+                                                     prompter(clip_img_preprocessing(images)), text_tokens,
+                                                     prompt_token)
 
                     # output_org, _ = model(clip_img_preprocessing(images), text_tokens)
                     output_org, _ = multiGPU_CLIP(model_image, model_text, model, clip_img_preprocessing(images),
-                                            text_tokens, None)
+                                                  text_tokens, None)
 
                     loss = criterion(output_prompt, target)
 
@@ -771,9 +790,9 @@ def validate(val_loader_list, val_dataset_name, texts_list, model, model_text, m
                 torch.cuda.empty_cache()
 
                 # generate adv example
-                delta_prompt = attack_pgd(prompter, model, model_text, model_image, add_prompter, criterion, images, target, text_tokens,
-                                        args.test_stepsize, args.test_numsteps, 'l_inf', epsilon=args.test_eps)
-
+                delta_prompt = attack_pgd(prompter, model, model_text, model_image, add_prompter, criterion, images,
+                                          target, text_tokens,
+                                          args.test_stepsize, args.test_numsteps, 'l_inf', epsilon=args.test_eps)
 
                 # compute output
                 torch.cuda.empty_cache()
@@ -781,21 +800,23 @@ def validate(val_loader_list, val_dataset_name, texts_list, model, model_text, m
                     prompt_token = add_prompter()
                     # output_prompt_adv, _ = model(prompter(clip_img_preprocessing(images + delta_prompt)), text_tokens, prompt_token)
                     output_prompt_adv, _ = multiGPU_CLIP(model_image, model_text, model,
-                                                        prompter(clip_img_preprocessing(images + delta_prompt)), text_tokens, prompt_token)
+                                                         prompter(clip_img_preprocessing(images + delta_prompt)),
+                                                         text_tokens, prompt_token)
 
                     loss = criterion(output_prompt_adv, target)
 
                 # bl attack
                 torch.cuda.empty_cache()
 
-                delta_noprompt = attack_pgd_noprompt(prompter, model, model_text, model_image, criterion, images, target, text_tokens, args.test_stepsize, args.test_numsteps,
-                                        'l_inf', epsilon=args.test_eps)
+                delta_noprompt = attack_pgd_noprompt(prompter, model, model_text, model_image, criterion, images,
+                                                     target, text_tokens, args.test_stepsize, args.test_numsteps,
+                                                     'l_inf', epsilon=args.test_eps)
                 torch.cuda.empty_cache()
                 with torch.no_grad():
                     # output_org_adv, _ = model(clip_img_preprocessing(images+delta_noprompt), text_tokens)
                     output_org_adv, _ = multiGPU_CLIP(model_image, model_text, model,
-                                                    clip_img_preprocessing(images + delta_noprompt),
-                                                    text_tokens, None)
+                                                      clip_img_preprocessing(images + delta_noprompt),
+                                                      text_tokens, None)
 
                 torch.cuda.empty_cache()
                 # measure accuracy and record loss
@@ -815,11 +836,10 @@ def validate(val_loader_list, val_dataset_name, texts_list, model, model_text, m
                 if args.debug:
                     break
 
-
         torch.cuda.empty_cache()
 
         print(dataset_name + ' * Adv Prompt Acc@1 {top1_adv_prompt.avg:.3f} Adv Original Acc@1 {top1_adv_org.avg:.3f} '
-              '*  Prompt Acc@1 {top1_prompt.avg:.3f} Original Acc@1 {top1_org.avg:.3f}'
+                             '*  Prompt Acc@1 {top1_prompt.avg:.3f} Original Acc@1 {top1_org.avg:.3f}'
               .format(top1_adv_prompt=top1_adv_prompt, top1_adv_org=top1_adv_org,
                       top1_prompt=top1_prompt, top1_org=top1_org))
         acc_all.append(top1_adv_prompt.avg)
@@ -832,6 +852,7 @@ def validate(val_loader_list, val_dataset_name, texts_list, model, model_text, m
     #     })
 
     return np.mean(acc_all)
+
 
 if __name__ == '__main__':
     main()

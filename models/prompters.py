@@ -64,6 +64,16 @@ class RandomPatchPrompter(nn.Module):
         return x + prompt
 
 
+
+class NullPrompter(nn.Module):
+    def __init__(self):
+        super(NullPrompter, self).__init__()
+        pass
+
+    def forward(self, x):
+        return x
+
+
 def padding(args):
     return PadPrompter(args)
 
