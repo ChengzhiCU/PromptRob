@@ -367,8 +367,6 @@ def main():
     train_sampler = None
     val_sampler = None
 
-
-
     train_loader = DataLoader(train_dataset,
                               batch_size=args.batch_size, pin_memory=True,
                               num_workers=args.num_workers, shuffle=True, sampler=train_sampler)
@@ -400,14 +398,14 @@ def main():
                 from utils import load_imagenet_folder2name
                 folder2name = load_imagenet_folder2name('imagenet_classes_names.txt')
                 new_class_names = []
-                for each in class_names:
-                    new_class_names.append(folder2name[each])
+                for class_name in class_names:
+                    new_class_names.append(folder2name[class_name])
                 class_names = new_class_names
 
             class_names = refine_classname(class_names)
             texts_tmp = [template.format(label) for label in class_names]
         texts_list.append(texts_tmp)
-    assert len(texts_list) = len(val_dataset_list)
+    assert len(texts_list) == len(val_dataset_list)
 
     # define criterion and optimizer
     optimizer = torch.optim.SGD(list(prompter.parameters())+list(add_prompter.parameters()),
